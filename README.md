@@ -10,9 +10,9 @@ for transport; JSON is handled by the SDK's own tiny writer and reader.
 * Docs: https://ravensight.io/docs/
 * C++17, CMake 3.16 or newer, libcurl
 
-## BETA notice
+## Verification status
 
-This library is a beta. The protocol logic is written and reviewed against
+The protocol logic is written and reviewed against
 the live API contract, it compiles cleanly on macOS (Apple clang) and Linux
 (gcc and clang, in CI), and the full unit test suite runs on every push. It
 has **not** yet shipped inside a released game.
