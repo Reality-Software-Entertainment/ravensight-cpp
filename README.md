@@ -8,6 +8,7 @@ for transport; JSON is handled by the SDK's own tiny writer and reader.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
+* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`client.set_enabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * C++17, CMake 3.16 or newer, libcurl
 
 ## Verification status
@@ -220,6 +221,16 @@ machine.
 
 `client.set_enabled(false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
+
+The opt-out is not stored by the SDK: keep the player's choice in your own
+settings and call `client.set_enabled(false)` before the first event on every
+launch. To forget this install's analytics identity, delete the `device_id_file` you configured (with no file the id is new every run);
+the next run starts under a fresh id and nothing links the old one back.
+
+A game that sends gameplay events and nothing else can declare Device ID and
+Product Interaction as not linked to the player and not used for tracking,
+and needs no tracking permission prompt. The row by row answers for the App
+Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
 ## License
 
