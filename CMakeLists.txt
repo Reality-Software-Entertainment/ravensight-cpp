@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ravensight
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Official C++ SDK for Ravensight player analytics"
     HOMEPAGE_URL "https://ravensight.io"
     LANGUAGES CXX)
@@ -21,6 +21,7 @@ add_library(ravensight
     src/curl_transport.cpp
     src/json.cpp
     src/queue.cpp
+    src/storage.cpp
     src/transport.cpp)
 add_library(ravensight::ravensight ALIAS ravensight)
 
@@ -42,6 +43,10 @@ find_package(Threads REQUIRED)
 target_link_libraries(ravensight
     PRIVATE CURL::libcurl
     PUBLIC Threads::Threads)
+if(WIN32)
+    # BCryptGenRandom, the device id random source on Windows.
+    target_link_libraries(ravensight PRIVATE bcrypt)
+endif()
 
 if(MSVC)
     target_compile_options(ravensight PRIVATE /W4)
@@ -57,8 +62,11 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/test_main.cpp
         tests/json_tests.cpp
         tests/queue_tests.cpp
-        tests/client_tests.cpp)
+        tests/client_tests.cpp
+        tests/storage_tests.cpp
+        tests/conformance_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
+    target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
     if(MSVC)
         target_compile_options(ravensight_tests PRIVATE /W4)
     else()

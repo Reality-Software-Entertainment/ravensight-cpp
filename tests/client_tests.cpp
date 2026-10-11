@@ -5,6 +5,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <future>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -122,9 +125,19 @@ Response default_routes(const Request& request) {
     return json_response(404, "{\"error\":\"not_found\"}");
 }
 
+std::string make_temp_dir() {
+    std::string base = std::filesystem::temp_directory_path().string();
+    const std::filesystem::path dir =
+        std::filesystem::path(base) / ("ravensight-test-" + generate_device_id());
+    return dir.string();
+}
+
 Config test_config() {
     Config config;
     config.ingest_key = "gt_live_test_key";
+    // Never touch the real per user directory from a test.
+    config.storage_dir = make_temp_dir();
+    config.log = [](const std::string&) {};
     config.api_url = "https://api.example.test";
     config.game_version = "9.9.9";
     config.platform = "test";
@@ -156,6 +169,17 @@ RS_TEST(client_normalizes_api_urls) {
     CHECK_EQ(Client::normalize_api_url("https://api.ravensight.io/api/v1"),
              std::string("https://api.ravensight.io/api/v1"));
     CHECK_EQ(Client::normalize_api_url(""), std::string("https://api.ravensight.io/api/v1"));
+    CHECK_EQ(Client::normalize_api_url("   "), std::string("https://api.ravensight.io/api/v1"));
+    CHECK_EQ(Client::normalize_api_url("https://api.ravensight.io/api/v1/"),
+             std::string("https://api.ravensight.io/api/v1"));
+    CHECK_EQ(Client::normalize_api_url("  https://self.example.test//  "),
+             std::string("https://self.example.test/api/v1"));
+    CHECK_EQ(Client::normalize_api_url("https://self.example.test/api/v1//"),
+             std::string("https://self.example.test/api/v1"));
+    CHECK_EQ(Client::normalize_api_url("http://localhost:3000/api/v1"),
+             std::string("http://localhost:3000/api/v1"));
+    // The default is the bare host.
+    CHECK_EQ(Config{}.api_url, std::string("https://api.ravensight.io"));
 }
 
 RS_TEST(client_happy_path_sends_session_then_batch) {
@@ -250,16 +274,21 @@ RS_TEST(client_batches_of_fifty) {
     }
     CHECK(client.flush_and_wait(5.0));
 
-    std::vector<std::size_t> sizes;
+    // Batches may start as soon as 50 are queued, so their boundaries depend
+    // on timing; none is ever larger than 50 and every event goes out once.
+    std::size_t total = 0;
+    std::size_t batches = 0;
     for (const Request& request : fake->requests()) {
         if (ends_with(request.url, "/track/batch")) {
-            sizes.push_back(batch_event_count(request));
+            const std::size_t size = batch_event_count(request);
+            CHECK(size <= std::size_t(50));
+            CHECK(size > std::size_t(0));
+            total += size;
+            ++batches;
         }
     }
-    REQUIRE(sizes.size() == std::size_t(3));
-    CHECK_EQ(sizes[0], std::size_t(50));
-    CHECK_EQ(sizes[1], std::size_t(50));
-    CHECK_EQ(sizes[2], std::size_t(20));
+    CHECK_EQ(total, std::size_t(120));
+    CHECK(batches >= std::size_t(3));
     CHECK_EQ(client.stats().sent, 120);
     CHECK_EQ(client.stats().queued, 0);
 }
@@ -345,7 +374,7 @@ RS_TEST(client_feedback_success_and_validation) {
     std::condition_variable cv;
     bool done = false;
     FeedbackResult result;
-    client.submit_feedback("The boss fight drags", "balance", 3, [&](const FeedbackResult& r) {
+    client.submit_feedback("The boss fight drags", "suggestion", 3, [&](const FeedbackResult& r) {
         std::lock_guard<std::mutex> lock(mutex);
         result = r;
         done = true;
@@ -364,7 +393,7 @@ RS_TEST(client_feedback_success_and_validation) {
             found = true;
             const json::Value body = json::Value::parse(request.body);
             CHECK_EQ(body.get_string("message", ""), std::string("The boss fight drags"));
-            CHECK_EQ(body.get_string("category", ""), std::string("balance"));
+            CHECK_EQ(body.get_string("category", ""), std::string("suggestion"));
             double rating = 0.0;
             CHECK(body.get_number("rating", rating));
             CHECK_EQ(rating, 3.0);
