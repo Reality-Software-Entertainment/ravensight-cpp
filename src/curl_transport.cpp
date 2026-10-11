@@ -1,8 +1,11 @@
 // Copyright 2026 Reality Software Entertainment. MIT licensed.
 
 #include "ravensight/curl_transport.hpp"
+#include "ravensight/version.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
@@ -52,6 +55,21 @@ size_t header_callback(char* data, size_t size, size_t count, void* userdata) {
     return total;
 }
 
+double wall_clock_seconds() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// Aborts the transfer once the request's shutdown deadline passes.
+int progress_callback(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    const std::atomic<double>* abort_at = static_cast<const std::atomic<double>*>(userdata);
+    if (abort_at == nullptr) {
+        return 0;
+    }
+    const double deadline = abort_at->load();
+    return (deadline > 0.0 && wall_clock_seconds() >= deadline) ? 1 : 0;
+}
+
 } // namespace
 
 CurlTransport::CurlTransport(double timeout_seconds)
@@ -77,15 +95,30 @@ Response CurlTransport::send(const Request& request) {
     Capture capture;
     curl_easy_setopt(handle, CURLOPT_URL, request.url.c_str());
     curl_easy_setopt(handle, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_seconds_ * 1000.0));
-    curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS,
-                     static_cast<long>(timeout_seconds_ * 1000.0));
+    double timeout = timeout_seconds_;
+    if (request.abort_at_unix_seconds != nullptr) {
+        const double deadline = request.abort_at_unix_seconds->load();
+        if (deadline > 0.0) {
+            const double remaining = deadline - wall_clock_seconds();
+            if (remaining <= 0.0) {
+                return Response::network_failure("shutdown deadline passed");
+            }
+            timeout = std::min(timeout, remaining);
+        }
+        curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, &progress_callback);
+        curl_easy_setopt(handle, CURLOPT_XFERINFODATA,
+                         const_cast<std::atomic<double>*>(request.abort_at_unix_seconds));
+        curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+    }
+    const long timeout_ms = std::max(1L, static_cast<long>(timeout * 1000.0));
+    curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
     curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, &write_callback);
     curl_easy_setopt(handle, CURLOPT_WRITEDATA, &capture);
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &header_callback);
     curl_easy_setopt(handle, CURLOPT_HEADERDATA, &capture);
-    curl_easy_setopt(handle, CURLOPT_USERAGENT, "ravensight-cpp/0.1.0");
+    curl_easy_setopt(handle, CURLOPT_USERAGENT, "ravensight-cpp/" RAVENSIGHT_VERSION);
 
     curl_slist* headers = nullptr;
     for (const auto& header : request.headers) {

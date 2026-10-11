@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,6 +22,12 @@ struct Request {
     /// Serialized JSON body, empty for a GET.
     std::string body;
     std::vector<std::pair<std::string, std::string>> headers;
+
+    /// When non null and holding a value above zero: a wall clock deadline in
+    /// Unix seconds. A transport should give up on the request (status 0)
+    /// once it passes. The Client sets it during shutdown so the final flush
+    /// holds the quit for at most 1.5 seconds. Transports may ignore it.
+    const std::atomic<double>* abort_at_unix_seconds = nullptr;
 
     Request& with_header(std::string name, std::string value) {
         headers.emplace_back(std::move(name), std::move(value));
