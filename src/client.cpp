@@ -468,7 +468,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!shutdown_requested_ && queue_.is_active()) {
+            if (!shutdown_requested_ && queue_.is_active() && !invalid_key_) {
                 commands_.push_back([this, callback] { run_suggestions(callback); });
                 cv_.notify_all();
                 return;
@@ -540,9 +540,17 @@ public:
         device_id_saved_ = !config_.device_id.empty();
         if (queue_.is_active()) {
             persist_device_id_locked();
+        } else if (!device_id_saved_ && !paths_.device_file.empty()) {
+            // Disabled or opted out: the new id is not written yet, but the
+            // old one must not come back on a later launch.
+            if (!detail::remove_file(paths_.device_file)) {
+                note_locked("could not delete the saved device id at " + paths_.device_file, true);
+            }
         }
         queue_.clear();
         queue_.invalidate_session();
+        // A session request already in flight belongs to the old id.
+        ++identity_generation_;
         schedule_settings_check_locked();
         return device_id_;
     }
@@ -899,10 +907,12 @@ private:
                 return false;
             }
             std::string join_token;
+            unsigned long long generation = 0;
             json::ObjectWriter body;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 join_token = join_token_;
+                generation = identity_generation_;
                 body.add("deviceId", device_id_);
             }
             body.add("gameVersion", config_.game_version);
@@ -936,6 +946,12 @@ private:
                 }
                 if (!queue_.is_active()) {
                     // Opted out or stopped while the request was in flight.
+                    return false;
+                }
+                if (generation != identity_generation_) {
+                    // reset_device_id() ran meanwhile: this session is the
+                    // old identity's. Drop it; the next attempt uses the new id.
+                    note_locked("discarded a session opened for the previous device id", false);
                     return false;
                 }
                 queue_.set_session(token, expires_at);
@@ -1175,8 +1191,14 @@ private:
 
     void run_suggestions(const SuggestionsCallback& callback) {
         maybe_check_settings();
-        // Re-checked here: the player may have opted out while this waited.
-        if (!is_active()) {
+        // Re-checked here: the player may have opted out, or the key been
+        // refused, while this waited.
+        bool may_send;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            may_send = queue_.is_active() && !invalid_key_;
+        }
+        if (!may_send) {
             callback(false, empty_array());
             return;
         }
@@ -1298,6 +1320,7 @@ private:
     bool invalid_key_warned_ = false;
     bool bad_event_warned_ = false;
     bool storage_warned_ = false;
+    unsigned long long identity_generation_ = 0;
     bool nudge_ = false;
     bool wake_ = false;
     bool shutdown_requested_ = false;

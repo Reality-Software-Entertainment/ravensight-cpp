@@ -26,6 +26,12 @@ struct Registrar {
     Registrar(const char* name, void (*fn)()) { registry().push_back(TestCase{name, fn}); }
 };
 
+/// Run after every test case (for example to delete temporary directories).
+inline std::vector<void (*)()>& after_each_hooks() {
+    static std::vector<void (*)()> hooks;
+    return hooks;
+}
+
 inline int& failure_count() {
     static int count = 0;
     return count;
@@ -70,6 +76,9 @@ inline int run_all() {
         const int failures_before = failure_count();
         std::printf("[ RUN  ] %s\n", test.name);
         test.fn();
+        for (void (*hook)() : after_each_hooks()) {
+            hook();
+        }
         ++ran;
         if (failure_count() == failures_before) {
             std::printf("[  OK  ] %s\n", test.name);

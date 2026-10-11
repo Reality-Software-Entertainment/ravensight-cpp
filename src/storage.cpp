@@ -2,6 +2,7 @@
 
 #include "storage.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,8 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <io.h>
+#include <process.h>
 #elif defined(__APPLE__)
 #include <sys/random.h>
 #include <unistd.h>
@@ -24,6 +27,10 @@
     (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
 #include <unistd.h>
 #define RAVENSIGHT_HAVE_GETENTROPY 1
+#endif
+
+#if !defined(_WIN32)
+#include <unistd.h>
 #endif
 
 namespace ravensight {
@@ -206,29 +213,61 @@ bool read_text_file(const std::string& path, std::string& out) {
     return true;
 }
 
+namespace {
+
+// Unique per process and per call, so two writers never share a temp file.
+std::string temp_path_for(const std::string& path) {
+    static std::atomic<unsigned long long> counter{0};
+#if defined(_WIN32)
+    const long long pid = static_cast<long long>(_getpid());
+#else
+    const long long pid = static_cast<long long>(getpid());
+#endif
+    return path + ".tmp." + std::to_string(pid) + "." + std::to_string(++counter);
+}
+
+bool flush_to_disk(std::FILE* file) {
+    if (std::fflush(file) != 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    return _commit(_fileno(file)) == 0;
+#else
+    return fsync(fileno(file)) == 0;
+#endif
+}
+
+} // namespace
+
 bool write_text_file(const std::string& path, const std::string& text) {
     if (!ensure_directory(parent_dir(path))) {
         return false;
     }
-    const std::string temp = path + ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            return false;
-        }
-        out << text;
-        out.flush();
-        if (!out) {
-            return false;
-        }
+    const std::string temp = temp_path_for(path);
+    std::FILE* file = std::fopen(temp.c_str(), "wb");
+    if (file == nullptr) {
+        return false;
     }
+    const bool written = std::fwrite(text.data(), 1, text.size(), file) == text.size() &&
+                         flush_to_disk(file);
+    const bool closed = std::fclose(file) == 0;
     std::error_code error;
+    if (!written || !closed) {
+        fs::remove(fs::path(temp), error);
+        return false;
+    }
     fs::rename(fs::path(temp), fs::path(path), error);
     if (error) {
         fs::remove(fs::path(temp), error);
         return false;
     }
     return true;
+}
+
+bool remove_file(const std::string& path) {
+    std::error_code error;
+    fs::remove(fs::path(path), error);
+    return !error && !fs::exists(fs::path(path), error);
 }
 
 std::string env_value(const char* name) {

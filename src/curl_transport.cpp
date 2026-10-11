@@ -103,14 +103,14 @@ Response CurlTransport::send(const Request& request) {
             if (remaining <= 0.0) {
                 return Response::network_failure("shutdown deadline passed");
             }
-            timeout = std::min(timeout, remaining);
+            timeout = (std::min)(timeout, remaining);
         }
         curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, &progress_callback);
         curl_easy_setopt(handle, CURLOPT_XFERINFODATA,
                          const_cast<std::atomic<double>*>(request.abort_at_unix_seconds));
         curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
     }
-    const long timeout_ms = std::max(1L, static_cast<long>(timeout * 1000.0));
+    const long timeout_ms = (std::max)(1L, static_cast<long>(timeout * 1000.0));
     curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms);
     curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L);

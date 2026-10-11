@@ -47,6 +47,9 @@ bool read_text_file(const std::string& path, std::string& out);
 /// parent directory first. False on any failure.
 bool write_text_file(const std::string& path, const std::string& text);
 
+/// Deletes a file. True when it is gone afterwards (or never existed).
+bool remove_file(const std::string& path);
+
 /// An environment variable, empty when unset.
 std::string env_value(const char* name);
 

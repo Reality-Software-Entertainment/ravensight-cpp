@@ -268,8 +268,8 @@ public:
     /// EXPERIMENTAL. Fetches AI generated design suggestions for this game.
     /// Empty until the game has enough data for a weekly digest, and the
     /// shape of each entry may change, so do not build game logic on it.
-    /// While the client is not sending it calls back at once with
-    /// (false, empty array) and makes no request; otherwise the callback
+    /// While the client is not sending (or the key was refused) it calls back
+    /// at once with (false, empty array) and makes no request; otherwise the callback
     /// runs on the worker thread.
     void fetch_suggestions(SuggestionsCallback callback);
 
@@ -290,7 +290,9 @@ public:
     bool is_tracking_enabled_by_player() const;
 
     /// Mints and saves a new random device id, discards the queue and drops
-    /// the session, so nothing links the old id to the new one. Returns the
+    /// the session, so nothing links the old id to the new one. While the
+    /// client is disabled or opted out the old saved id is deleted and the
+    /// new one is saved once the client may send again. Returns the
     /// new id. A no-op that logs one line during a playtest run (it returns
     /// the current id).
     std::string reset_device_id();

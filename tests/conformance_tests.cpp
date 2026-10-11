@@ -20,6 +20,7 @@
 
 #include "ravensight/client.hpp"
 #include "storage.hpp"
+#include "temp_dirs.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -193,7 +194,7 @@ struct LogLines {
 };
 
 std::string temp_dir() {
-    return (fs::temp_directory_path() / ("ravensight-conf-" + generate_device_id())).string();
+    return rstest::make_temp_dir("ravensight-conf-");
 }
 
 Config base_config(const std::shared_ptr<LogLines>& logs = nullptr) {
@@ -464,6 +465,115 @@ RS_TEST(reset_device_id_mints_saves_and_drops_queue_and_session) {
     for (const std::string& name : fake->sent_event_names()) {
         CHECK(name != "pending");
     }
+}
+
+RS_TEST(reset_while_opted_out_does_not_bring_the_old_id_back) {
+    Config config = base_config();
+    std::string old_id;
+    {
+        auto fake = std::make_shared<Fake>();
+        Client client(config, proxy(fake));
+        CHECK(client.track("x"));
+        CHECK(client.flush_and_wait(3.0));
+        old_id = client.device_id();
+        client.set_tracking_enabled(false);
+        const std::string fresh = client.reset_device_id();
+        CHECK(fresh != old_id);
+        // Nothing is written while opted out, and the old id is gone.
+        CHECK(!fs::exists(fs::path(config.storage_dir) / "device_id"));
+    }
+    auto fake = std::make_shared<Fake>();
+    Client next(config, proxy(fake));
+    CHECK(next.device_id() != old_id);
+    next.set_tracking_enabled(true);
+    CHECK(next.track("y"));
+    CHECK(next.flush_and_wait(3.0));
+    std::size_t sessions = 0;
+    for (const Request& request : fake->requests()) {
+        if (ends_with(request.url, "/session")) {
+            ++sessions;
+            const std::string sent = json::Value::parse(request.body).get_string("deviceId", "");
+            CHECK(sent != old_id);
+            CHECK_EQ(sent, next.device_id());
+        }
+    }
+    CHECK_EQ(sessions, std::size_t(1));
+}
+
+RS_TEST(session_opened_for_the_old_id_after_reset_is_discarded) {
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool first_started = false;
+    bool release = false;
+    std::atomic<int> sessions{0};
+    auto fake = std::make_shared<Fake>([&](const Request& request) {
+        if (ends_with(request.url, "/session")) {
+            const int n = sessions.fetch_add(1) + 1;
+            if (n == 1) {
+                std::unique_lock<std::mutex> lock(gate_mutex);
+                first_started = true;
+                gate_cv.notify_all();
+                gate_cv.wait_for(lock, std::chrono::seconds(3), [&] { return release; });
+            }
+            return reply(201, "{\"token\":\"st_" + std::to_string(n) + "\",\"expiresIn\":86400}");
+        }
+        return default_routes(request);
+    });
+    Config config = base_config();
+    config.flush_interval_seconds = 3600.0;
+    Client client(config, proxy(fake));
+    client.track("before_reset");
+    client.flush();
+    {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        REQUIRE(gate_cv.wait_for(lock, std::chrono::seconds(3), [&] { return first_started; }));
+    }
+    const std::string fresh = client.reset_device_id();
+    client.track("after_reset");
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        release = true;
+        gate_cv.notify_all();
+    }
+    CHECK(client.flush_and_wait(3.0));
+    CHECK_EQ(client.session_token(), std::string("st_2"));
+
+    std::vector<Request> session_requests;
+    for (const Request& request : fake->requests()) {
+        if (ends_with(request.url, "/session")) session_requests.push_back(request);
+        if (ends_with(request.url, "/track/batch")) {
+            CHECK_EQ(header_value(request, "X-Session-Token"), std::string("st_2"));
+            for (const std::string& name : batch_event_names(request)) {
+                CHECK(name != "before_reset");
+            }
+        }
+    }
+    REQUIRE(session_requests.size() == std::size_t(2));
+    CHECK_EQ(json::Value::parse(session_requests[1].body).get_string("deviceId", ""), fresh);
+    CHECK_EQ(fake->sent_event_names().size(), std::size_t(1));
+}
+
+RS_TEST(suggestions_are_not_requested_after_a_refused_key) {
+    auto fake = std::make_shared<Fake>([](const Request& request) {
+        if (ends_with(request.url, "/settings")) {
+            return reply(401, "{\"error\":\"invalid_key\"}");
+        }
+        return default_routes(request);
+    });
+    Client client(base_config(), proxy(fake));
+    REQUIRE(fake->wait_for(1));
+    sleep_seconds(0.1);
+    REQUIRE(client.status() == Status::invalid_key);
+    bool called = false;
+    bool ok = true;
+    client.fetch_suggestions([&](bool request_ok, const json::Value&) {
+        called = true;
+        ok = request_ok;
+    });
+    CHECK(called);
+    CHECK(!ok);
+    sleep_seconds(0.1);
+    CHECK_EQ(fake->count("/agent/suggestions"), std::size_t(0));
 }
 
 // --- Refused key and kill switch -------------------------------------------------

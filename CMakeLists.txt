@@ -46,6 +46,8 @@ target_link_libraries(ravensight
 if(WIN32)
     # BCryptGenRandom, the device id random source on Windows.
     target_link_libraries(ravensight PRIVATE bcrypt)
+    # windows.h (pulled in by curl.h and bcrypt.h) must not define min/max.
+    target_compile_definitions(ravensight PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 if(MSVC)

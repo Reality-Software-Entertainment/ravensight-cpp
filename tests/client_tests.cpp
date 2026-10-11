@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ravensight/client.hpp"
+#include "temp_dirs.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -125,18 +126,11 @@ Response default_routes(const Request& request) {
     return json_response(404, "{\"error\":\"not_found\"}");
 }
 
-std::string make_temp_dir() {
-    std::string base = std::filesystem::temp_directory_path().string();
-    const std::filesystem::path dir =
-        std::filesystem::path(base) / ("ravensight-test-" + generate_device_id());
-    return dir.string();
-}
-
 Config test_config() {
     Config config;
     config.ingest_key = "gt_live_test_key";
     // Never touch the real per user directory from a test.
-    config.storage_dir = make_temp_dir();
+    config.storage_dir = rstest::make_temp_dir();
     config.log = [](const std::string&) {};
     config.api_url = "https://api.example.test";
     config.game_version = "9.9.9";

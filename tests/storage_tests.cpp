@@ -10,6 +10,7 @@
 
 #include "ravensight/client.hpp"
 #include "storage.hpp"
+#include "temp_dirs.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -83,10 +84,8 @@ RS_TEST(default_storage_dir_is_per_user_and_named_after_the_key) {
 }
 
 RS_TEST(text_files_round_trip_and_create_parents) {
-    const std::string dir = detail::join_path(
-        detail::join_path(std::filesystem::temp_directory_path().string(),
-                          "ravensight-storage-test-" + generate_device_id()),
-        "nested");
+    const std::string dir =
+        detail::join_path(rstest::make_temp_dir("ravensight-storage-test-"), "nested");
     const std::string path = detail::join_path(dir, "file");
     CHECK(detail::write_text_file(path, "hello"));
     std::string text;
@@ -96,4 +95,14 @@ RS_TEST(text_files_round_trip_and_create_parents) {
     CHECK(detail::read_text_file(path, text));
     CHECK_EQ(text, std::string("again"));
     CHECK(!detail::read_text_file(detail::join_path(dir, "missing"), text));
+    // No temporary files are left beside the target.
+    std::size_t entries = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        (void)entry;
+        ++entries;
+    }
+    CHECK_EQ(entries, std::size_t(1));
+    CHECK(detail::remove_file(path));
+    CHECK(!std::filesystem::exists(path));
+    CHECK(detail::remove_file(path)); // already gone is fine
 }
