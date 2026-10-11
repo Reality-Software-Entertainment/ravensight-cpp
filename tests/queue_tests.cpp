@@ -283,3 +283,72 @@ RS_TEST(stats_track_the_whole_lifecycle) {
     CHECK_EQ(stats.batches, 1);
     CHECK_EQ(stats.sessions, 1);
 }
+
+RS_TEST(accepted_batch_after_clear_keeps_new_events) {
+    Queue queue = queue_with_session(3);
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.should_send());
+    CHECK_EQ(plan.batch.size(), std::size_t(3));
+
+    // The player opts out and back in while the batch is in flight.
+    queue.set_locally_enabled(false);
+    queue.set_locally_enabled(true);
+    queue.enqueue(make_event(10));
+    queue.enqueue(make_event(11));
+
+    // The late 202 must not erase the two new events.
+    CHECK_EQ(queue.on_batch_accepted(plan), 0);
+    queue.end_flush();
+    CHECK_EQ(queue.count(), 2);
+    CHECK_EQ(queue.events().front().name, std::string("event_10"));
+    CHECK_EQ(queue.stats().sent, 0);
+}
+
+RS_TEST(accepted_batch_removes_exactly_its_events) {
+    Queue queue = queue_with_session(60);
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.should_send());
+    queue.enqueue(make_event(99));
+    CHECK_EQ(queue.on_batch_accepted(plan), 50);
+    queue.end_flush();
+    CHECK_EQ(queue.count(), 11);
+    CHECK_EQ(queue.stats().sent, 50);
+}
+
+RS_TEST(sequences_strictly_increase) {
+    Queue queue;
+    fill(queue, 5);
+    unsigned long long last = 0;
+    for (const Event& event : queue.events()) {
+        CHECK(event.sequence > last);
+        last = event.sequence;
+    }
+}
+
+RS_TEST(bad_request_single_event_after_clear_drops_nothing_new) {
+    Queue queue = queue_with_session(1);
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.should_send());
+    queue.clear();
+    queue.enqueue(make_event(7));
+    CHECK(!queue.on_bad_request(plan));
+    queue.end_flush();
+    CHECK_EQ(queue.count(), 1);
+    CHECK_EQ(queue.events().front().name, std::string("event_7"));
+}
+
+RS_TEST(bad_request_single_event_is_dropped_and_counted) {
+    Queue queue = queue_with_session(2);
+    // Force the limit down to one event.
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    CHECK(!queue.on_bad_request(plan));
+    queue.end_flush();
+    CHECK_EQ(queue.batch_limit(), 1);
+    plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.batch.size() == std::size_t(1));
+    CHECK(queue.on_bad_request(plan));
+    queue.end_flush();
+    CHECK_EQ(queue.count(), 1);
+    CHECK_EQ(queue.stats().dropped, 1);
+    CHECK_EQ(queue.events().front().name, std::string("event_1"));
+}

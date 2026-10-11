@@ -51,6 +51,11 @@ struct Event {
 
     /// Unix seconds, captured when the event happened rather than when it is sent.
     long long timestamp = 0;
+
+    /// Assigned by Queue::enqueue, strictly increasing. Lets an acknowledgment
+    /// remove exactly the events it carried, even if the queue was cleared
+    /// and refilled while the batch was in flight. Callers leave it at 0.
+    unsigned long long sequence = 0;
 };
 
 /// Why a flush attempt did or did not produce a batch to send.
@@ -158,8 +163,15 @@ public:
 
     // --- Responses ---------------------------------------------------------
 
-    /// HTTP 202. Removes the accepted events, restores the full batch limit
-    /// and clears any backoff.
+    /// HTTP 202 for the batch in plan. Removes only the events that batch
+    /// carried, matched by sequence number, so a 202 that lands after a
+    /// clear() and fresh enqueues cannot erase the new events. Restores the
+    /// full batch limit and clears any backoff. Returns how many were removed.
+    int on_batch_accepted(const FlushPlan& plan);
+
+    /// Positional variant: removes the first batch_size events. Only safe
+    /// when nothing cleared the queue since begin_flush. Prefer the FlushPlan
+    /// overload.
     void on_batch_accepted(std::size_t batch_size);
 
     /// HTTP 401. Drops the session token and leaves every event queued, so
@@ -176,6 +188,12 @@ public:
     /// A single event the server rejects outright is dropped so it cannot
     /// block everything queued behind it, and the limit is restored.
     void on_bad_request(std::size_t batch_size);
+
+    /// Same as on_bad_request(plan.batch.size()), except that the single
+    /// rejected event is dropped only if it is still at the head of the
+    /// queue (it may have been cleared while the request was in flight).
+    /// Returns true when an event was dropped.
+    bool on_bad_request(const FlushPlan& plan);
 
     /// Any other failure, including a connection that never completed.
     void on_transport_failure(double now_seconds);
@@ -212,6 +230,7 @@ private:
     int trim_to_cap(int headroom);
 
     std::deque<Event> events_;
+    unsigned long long next_sequence_ = 1;
     int max_queue_size_ = limits::default_queue_cap;
 
     bool server_tracking_enabled_ = true;

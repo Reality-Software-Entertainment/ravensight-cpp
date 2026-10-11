@@ -16,6 +16,7 @@ int Queue::enqueue(Event event) {
         return 0;
     }
     const int dropped = trim_to_cap(1);
+    event.sequence = next_sequence_++;
     events_.push_back(std::move(event));
     return dropped;
 }
@@ -99,6 +100,42 @@ void Queue::on_batch_accepted(std::size_t batch_size) {
     ++batch_count_;
     batch_limit_ = limits::max_batch_size;
     reset_backoff();
+}
+
+int Queue::on_batch_accepted(const FlushPlan& plan) {
+    int removed = 0;
+    if (!plan.batch.empty()) {
+        const unsigned long long first = plan.batch.front().sequence;
+        const unsigned long long last = plan.batch.back().sequence;
+        // Batches are always taken from the head, and sequences only grow,
+        // so the accepted events (if still queued) are a prefix.
+        while (!events_.empty() && events_.front().sequence >= first &&
+               events_.front().sequence <= last) {
+            events_.pop_front();
+            ++removed;
+        }
+    }
+    sent_count_ += removed;
+    ++batch_count_;
+    batch_limit_ = limits::max_batch_size;
+    reset_backoff();
+    return removed;
+}
+
+bool Queue::on_bad_request(const FlushPlan& plan) {
+    const std::size_t batch_size = plan.batch.size();
+    if (batch_size > 1) {
+        on_bad_request(batch_size);
+        return false;
+    }
+    batch_limit_ = limits::max_batch_size;
+    if (batch_size == 1 && !events_.empty() &&
+        events_.front().sequence == plan.batch.front().sequence) {
+        events_.pop_front();
+        ++dropped_count_;
+        return true;
+    }
+    return false;
 }
 
 void Queue::on_unauthorized() {
