@@ -2,6 +2,78 @@
 
 All notable changes to this library are documented here.
 
+## [0.2.0] - 2026-10-10
+
+Brings the C++ SDK to the shared Ravensight SDK contract. Pre-1.0, so this
+minor version contains breaking changes.
+
+### Breaking
+
+* The device id is saved by default, in a per user directory named after
+  the ingest key (`%APPDATA%\ravensight\<hash>`, `~/Library/Application
+  Support/ravensight/<hash>`, or `$XDG_DATA_HOME` or `~/.local/share` then
+  `ravensight/<hash>`). Before, without `device_id_file` every launch was a
+  new player. Set `Config::storage_dir` where there is no `HOME` or
+  `APPDATA`.
+* `game_started` is queued when the client starts, or, for a client
+  started disabled or opted out, when it is first enabled; never twice.
+* A refused ingest key (`401`, or a `403` other than the special codes) now
+  stops automatic sending for the run instead of retrying forever, and a
+  settings `401` no longer assumes tracking is on.
+* `Config::api_url` defaults to the bare host `https://api.ravensight.io`;
+  a trailing `/api/v1` is stripped and appended again, so either form works.
+* `Client::device_id()` returns `std::string` by value (it can change).
+* Feedback with a category outside the six accepted ones, or a rating
+  outside 1 to 5, is refused locally (`invalid_category`,
+  `invalid_rating`) instead of being sent. Feedback while disabled reports
+  the reason code (`disabled`, `tracking_disabled`, ...).
+* `track()` sends a batch as soon as 50 events are queued, not only on the
+  timer.
+
+### Added
+
+* `Client::set_tracking_enabled(bool)` and the free function
+  `ravensight::set_tracking_enabled(config, bool)`: the player's opt-out,
+  saved to `Config::state_file` at once and read at construction. A saved
+  opt-out wins over `Config::enabled`.
+* `Client::reset_device_id()`: a new saved id, the queue cleared and the
+  session dropped.
+* `Client::status()`, `ravensight::Status`, `ravensight::to_string` and
+  `Config::on_status`, using the shared reason codes `disabled`,
+  `invalid_key`, `tracking_disabled`, `offline`, `rate_limited`,
+  `session_failed` and `playtest_job_closed`.
+* The playtest path: `Config::playtest_token` and `playtest_run_id` (and
+  job id and persona), the `RAVENSIGHT_PLAYTEST_*` environment variables,
+  and `ravensight::apply_playtest_args` for the command line flags. A
+  playtest run uses `pt-<run id>` in memory only, sends the bare token in
+  `X-Ravensight-Playtest`, tags events as synthetic, and stops on
+  `playtest_job_closed` or `invalid_playtest_token`. `Client::is_playtest()`.
+* `Client::session_token()` and `Config::join_token`, sent once as
+  `joinToken`, with a fallback to a plain session on `invalid_join_token`.
+* `ravensight::feedback_categories`, `ravensight::generate_device_id`,
+  `ravensight::default_storage_dir`, `Config::storage_dir`,
+  `Config::state_file`, `Stats::last_error`, and `version.hpp`.
+* Tests for every item above, driven through a fake transport.
+
+### Fixed
+
+* A client built with `enabled = false` sent `GET /settings` at start, and
+  `fetch_suggestions` sent its request while the client was opted out or
+  kill switched. Neither touches the network now.
+* `403 tracking_disabled` from `POST /session` (or any endpoint) now stops
+  the run like the settings kill switch, instead of retrying.
+* Device ids take 16 bytes from the operating system's random source
+  (`BCryptGenRandom`, `getentropy` or `/dev/urandom`) instead of one 32 bit
+  seed.
+* A `202` arriving after the queue was cleared and refilled no longer
+  erases the new events: batches are acknowledged by sequence number.
+* `503` honors `Retry-After`. A batch `401` re-opens the session at most
+  twice in a row, then backs off.
+* The final flush at shutdown holds the quit for at most about 1.5 seconds
+  (the built in transport aborts a request in flight at that deadline).
+* The README and example sent the invalid feedback category `balance`;
+  they use `suggestion`.
+
 ## [0.1.0] - 2026-08-28
 
 First public beta.
