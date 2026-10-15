@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -19,7 +20,9 @@
 #include <utility>
 #include <vector>
 
+#include "health.hpp"
 #include "ravensight/curl_transport.hpp"
+#include "ravensight/version.hpp"
 #include "storage.hpp"
 
 #if defined(__APPLE__)
@@ -322,6 +325,15 @@ public:
         // The worker is not running yet, so the *_locked helpers are safe
         // to call here without the mutex.
         queue_.set_max_queue_size(config_.max_queue_size);
+        if (config_.performance) {
+            // Process start to this call, where the platform tells us when
+            // the process started.
+            const double started = process_start_unix_seconds();
+            const double now = now_unix_seconds();
+            if (started > 0.0 && now >= started) {
+                boot_ms_ = std::round((now - started) * 1000.0);
+            }
+        }
         join_token_ = detail::trim(config_.join_token);
         enabled_ = config_.enabled;
 
@@ -389,6 +401,12 @@ public:
             cv_.notify_all();
         }
         return true;
+    }
+
+    void sample_frame(double dt_seconds) {
+        if (config_.performance) {
+            health_.add_frame(dt_seconds);
+        }
     }
 
     void flush() {
@@ -917,6 +935,7 @@ private:
             }
             body.add("gameVersion", config_.game_version);
             body.add("platform", platform_);
+            body.add("sdk", "cpp/" RAVENSIGHT_VERSION);
             if (!join_token.empty()) {
                 body.add("joinToken", join_token);
             }
@@ -1274,6 +1293,28 @@ private:
         // the shutdown deadline. A refused key gets no further attempt here.
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (queue_.is_active() && config_.performance && !health_queued_) {
+                health_queued_ = true;
+                double fps_median = 0.0;
+                double fps_p10 = 0.0;
+                if (health_.summarize(fps_median, fps_p10)) {
+                    EventData summary{{"rs_kind", "health"},
+                                      {"rs_fps_median", fps_median},
+                                      {"rs_fps_p10", fps_p10}};
+                    const double memory_mb = process_memory_mb();
+                    if (memory_mb >= 0.0) {
+                        summary.emplace_back("rs_memory_mb", memory_mb);
+                    }
+                    if (boot_ms_ >= 0.0) {
+                        summary.emplace_back("rs_boot_ms", boot_ms_);
+                    }
+                    Event event;
+                    event.name = "health";
+                    event.data_json = write_fields(summary);
+                    event.timestamp = static_cast<long long>(now_unix_seconds());
+                    enqueue_locked(std::move(event));
+                }
+            }
             if (queue_.is_active() && config_.track_lifecycle_events && !exited_queued_) {
                 exited_queued_ = true;
                 Event event;
@@ -1317,6 +1358,9 @@ private:
     bool settings_checked_ = false;
     bool started_queued_ = false;
     bool exited_queued_ = false;
+    bool health_queued_ = false;
+    HealthSampler health_;
+    double boot_ms_ = -1.0;
     bool invalid_key_warned_ = false;
     bool bad_event_warned_ = false;
     bool storage_warned_ = false;
@@ -1350,6 +1394,8 @@ Client::~Client() = default;
 bool Client::track(const std::string& event_name, const EventData& data) {
     return impl_->track(event_name, data);
 }
+
+void Client::sample_frame(double dt_seconds) { impl_->sample_frame(dt_seconds); }
 
 void Client::flush() { impl_->flush(); }
 

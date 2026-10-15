@@ -37,6 +37,12 @@ int main(int argc, char** argv) {
     });
     client.track("run_over", {{"level", "castle"}, {"rs_kind", "death"}});
 
+    // Typed events: the reserved rs_ properties are built for you.
+    client.track_purchase(499, "usd", "pack", "gems_500");
+    client.track_resource("sink", "gold", 120.0, "weapon", "iron_sword");
+    client.track_progression("complete", "world1", "level3", "", 1250.5);
+    client.track_error("warning", "texture missing, using fallback");
+
     client.submit_feedback("The boss fight drags", "suggestion", 3,
                            [](const ravensight::FeedbackResult& result) {
                                std::printf("feedback: %s\n", result.ok ? "accepted" : result.code.c_str());

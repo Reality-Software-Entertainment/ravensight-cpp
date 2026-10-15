@@ -13,12 +13,12 @@ for transport; JSON is handled by the SDK's own tiny writer and reader.
 
 ## Verification status
 
-Version 0.2.0 was built and its unit tests run on macOS 27.0.1 with Apple
+Version 0.3.0 was built and its unit tests run on macOS 27.0.1 with Apple
 clang 21.0.0, CMake 4.3.4 and libcurl 8.7.1, using the commands in
-[Running the tests](#running-the-tests): 89 tests, all passing, with no
+[Running the tests](#running-the-tests): 110 tests, all passing, with no
 network involved. The CI workflow builds and runs the same suite on Linux
 with gcc and clang on pushes to main and on pull requests; it has not run
-on 0.2.0 yet. Windows (including the `BCryptGenRandom` and `%APPDATA%`
+on 0.3.0 yet. Windows (including the `BCryptGenRandom` and `%APPDATA%`
 paths), Android, iOS and consoles have not been built or run, and the SDK
 has **not** yet shipped inside a released game.
 
@@ -33,7 +33,7 @@ issue with anything you hit.
 include(FetchContent)
 FetchContent_Declare(ravensight
     GIT_REPOSITORY https://github.com/Reality-Software-Entertainment/ravensight-cpp.git
-    GIT_TAG v0.2.0)
+    GIT_TAG v0.3.0)
 FetchContent_MakeAvailable(ravensight)
 
 target_link_libraries(your_game PRIVATE ravensight::ravensight)
@@ -97,6 +97,11 @@ Everything game code needs is on `ravensight::Client`:
 | Call | What it does |
 | --- | --- |
 | `client.track(name, data)` | Queues an event. `data` is optional. Returns false when the client is not sending. Non blocking. |
+| `client.track_purchase(amount, currency, item_type, item_id, ...)` | Typed purchase event. See [Typed events](#typed-events). |
+| `client.track_resource(flow, resource, amount, ...)` | Typed resource source or sink event. |
+| `client.track_progression(status, p1, p2, p3, score, ...)` | Typed progression start, complete or fail event. |
+| `client.track_error(severity, message, stack, ...)` | Typed error event, message and stack cut to the limits. |
+| `client.sample_frame(dt_seconds)` | Call once per frame. With `Config::performance` it samples the frame rate once a second. |
 | `client.flush()` | Asks the worker to flush now. Non blocking. |
 | `client.flush_and_wait(timeout)` | Flushes and waits for the queue to drain. Blocking. |
 | `client.submit_feedback(message, category, rating, callback)` | Posts player feedback. The callback gets a `FeedbackResult`. |
@@ -157,6 +162,67 @@ name. Keys that start with `rs_` are reserved for Ravensight.
 client.track("boss_phase_begin", {{"level", "castle"}, {"rs_kind", "none"}});
 client.track("run_over", {{"level", "castle"}, {"rs_kind", "death"}});
 ```
+
+## Typed events
+
+The Implementation health card, the economy, progression and health pages
+read events that carry a few reserved `rs_` properties. These helpers build
+them for you and call `track()`, so queueing, batching, retries and opt-out
+behave as before, and each returns what `track()` returns. They never throw:
+a value the server cannot read is sent as given and the event is flagged on
+the Implementation health card instead.
+
+Every helper takes an optional `extra` property list, merged first so a
+reserved key always wins over a key of yours, and an optional event name
+that replaces the default.
+
+```cpp
+// Money is whole minor units: 499 is 4.99. An integer or a digit string.
+// The currency is upper-cased. Default event name: purchase.
+client.track_purchase(499, "usd", "pack", "gems_500", "cart_1", "txn_9");
+
+// flow is "source" or "sink". Default name: resource_source or resource_sink.
+client.track_resource("sink", "gold", 120.0, "weapon", "iron_sword");
+
+// status is "start", "complete" or "fail"; p2, p3 and score are optional.
+// Default name: progression_start, progression_complete or progression_fail.
+client.track_progression("complete", "world1", "level3", "", 1250.5);
+
+// severity is debug, info, warning, error or critical. The message is cut to
+// 200 characters and the stack to 2000. Default name: error.
+client.track_error("error", "save file unreadable", "at load_save()");
+
+// Extra properties and a custom event name.
+client.track_purchase(99, "usd", "skin", "red_cape", "", "",
+                      {{"source", "shop"}}, "iap");
+```
+
+### Health sampling
+
+Performance sampling is opt in. Set `Config::performance = true` and call
+`client.sample_frame(dt)` once per rendered frame with the frame time in
+seconds. The client has its own worker thread and no frame hook, so your game
+loop makes the call. It takes at most one sample per second and keeps at most
+600. When the client shuts down it sends exactly one `health` event with the
+median and the slowest tenth (10th percentile, nearest rank) frames per second,
+plus memory in megabytes and boot time in milliseconds (process start to
+client construction) on macOS and Linux. Windows, Android and consoles send
+frame rates only. If no sample was taken, nothing is sent.
+
+```cpp
+ravensight::Config config;
+config.ingest_key = "gt_live_...";
+config.performance = true;
+ravensight::Client client(config);
+
+while (running) {
+    const double dt = render_frame();
+    client.sample_frame(dt);
+}
+client.shutdown(); // sends the one health event, then game_exited
+```
+
+The session request also carries `"sdk": "cpp/<version>"`.
 
 ## Configuration
 
