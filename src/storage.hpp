@@ -21,6 +21,15 @@ std::string sha256_hex(const std::string& data);
 /// /dev/urandom. Returns false when none of them worked.
 bool os_random_bytes(unsigned char* out, std::size_t n);
 
+/// os_random_bytes, falling back to std::random_device when it fails.
+void random_bytes(unsigned char* out, std::size_t n);
+
+/// bytes random bytes as lower case hex (twice as many characters).
+std::string random_hex(std::size_t bytes);
+
+/// A draw in [0, 1) from the random source above, for backoff jitter.
+double random_unit();
+
 /// The default storage directory for this ingest key, or empty when the
 /// platform gives no per user location (no APPDATA or HOME). The directory
 /// is not created here.

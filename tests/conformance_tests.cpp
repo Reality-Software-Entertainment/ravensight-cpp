@@ -1,6 +1,7 @@
 // Copyright 2026 Reality Software Entertainment. MIT licensed.
 //
-// Conformance tests for the shared SDK contract (0.2.0): nothing on the
+// Conformance tests for the shared SDK contract (0.2.0, with the 0.3.0
+// refused key rule: the run ends): nothing on the
 // network while disabled, the saved opt-out, reset, refused keys, the kill
 // switch, Retry-After, feedback validation, the playtest path, the session
 // hand-off and the lifecycle once-guards. Driven through a fake transport;
@@ -14,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -596,11 +598,14 @@ RS_TEST(settings_401_makes_one_request_then_none) {
     };
     Client client(config, proxy(fake));
     REQUIRE(fake->wait_for(1));
-    CHECK(client.track("kept")); // still queues while the key is refused
-    sleep_seconds(0.3);          // six timer ticks
+    sleep_seconds(0.1);
+    CHECK(!client.track("dropped")); // the run has ended: nothing queues
+    sleep_seconds(0.3);              // six timer ticks
     CHECK_EQ(fake->total(), std::size_t(1));
     CHECK(client.status() == Status::invalid_key);
-    CHECK_EQ(client.stats().queued, 1);
+    CHECK(!client.tracking_enabled());
+    CHECK(!client.is_collecting());
+    CHECK_EQ(client.stats().queued, 0);
     CHECK_EQ(logs->count_containing(
                  "Ravensight: ingest key refused (invalid_key), sending stopped for this run. "
                  "Check your gt_live_ key."),
@@ -612,32 +617,38 @@ RS_TEST(settings_401_makes_one_request_then_none) {
         CHECK(statuses.back() == Status::invalid_key);
     }
 
-    // An explicit flush makes exactly one more attempt.
+    // An explicit flush makes no further attempt either.
     client.flush();
-    REQUIRE(fake->wait_for(2));
     sleep_seconds(0.2);
-    CHECK_EQ(fake->count("/session"), std::size_t(1));
+    CHECK_EQ(fake->count("/session"), std::size_t(0));
     client.shutdown();
-    // The shutdown flush makes no further attempt on a refused key.
-    CHECK_EQ(fake->total(), std::size_t(2));
+    // Nor does the shutdown flush.
+    CHECK_EQ(fake->total(), std::size_t(1));
     CHECK_EQ(logs->count_containing("ingest key refused"), std::size_t(1));
 }
 
-RS_TEST(explicit_flush_after_a_refused_key_recovers_when_the_key_works) {
+RS_TEST(explicit_flush_after_a_refused_key_sends_nothing) {
     auto fake = std::make_shared<Fake>([](const Request& request) {
         if (ends_with(request.url, "/settings")) {
             return reply(401, "{\"error\":\"invalid_key\"}");
         }
         return default_routes(request);
     });
-    Client client(base_config(), proxy(fake));
+    Config config = base_config();
+    config.track_lifecycle_events = true;
+    Client client(config, proxy(fake));
     REQUIRE(fake->wait_for(1));
-    CHECK(client.track("kept"));
     sleep_seconds(0.15);
+    CHECK_EQ(client.stats().queued, 0); // game_started was cleared
+    CHECK(!client.track("late"));
+    CHECK(client.flush_and_wait(1.0));
+    client.set_tracking_enabled(false);
+    client.set_tracking_enabled(true); // saved, restarts nothing
+    sleep_seconds(0.15);
+    client.shutdown();
     CHECK_EQ(fake->total(), std::size_t(1));
-    CHECK(client.flush_and_wait(3.0));
-    CHECK_EQ(client.stats().sent, 1);
-    CHECK(client.status() == Status::ok);
+    CHECK_EQ(client.stats().sent, 0);
+    CHECK(client.status() == Status::invalid_key);
 }
 
 RS_TEST(session_401_stops_automatic_retries) {
@@ -1162,4 +1173,383 @@ RS_TEST(shutdown_holds_the_quit_for_at_most_about_one_and_a_half_seconds) {
     CHECK(held >= 1.3);
     CHECK(held < 2.5);
     CHECK_EQ(fake->count("/track/batch"), std::size_t(1));
+}
+
+// --- Public builds (0.3.0) -----------------------------------------------------------
+
+namespace {
+
+std::vector<std::string> files_in(const std::string& dir) {
+    std::vector<std::string> names;
+    std::error_code error;
+    if (!fs::exists(fs::path(dir), error)) {
+        return names;
+    }
+    for (const auto& entry : fs::directory_iterator(fs::path(dir), error)) {
+        names.push_back(entry.path().filename().string());
+    }
+    return names;
+}
+
+/// Every event's data object from every batch sent, in order.
+std::vector<json::Value> sent_event_data(const Fake& fake) {
+    std::vector<json::Value> out;
+    for (const Request& request : fake.requests()) {
+        if (ends_with(request.url, "/track/batch")) {
+            const json::Value parsed = json::Value::parse(request.body);
+            const json::Value* events = parsed.find("events");
+            for (std::size_t i = 0; events != nullptr && i < events->size(); ++i) {
+                const json::Value* data = events->at(i).find("data");
+                out.push_back(data != nullptr ? *data : json::Value());
+            }
+        }
+    }
+    return out;
+}
+
+std::string event_id_of(const json::Value& data) { return data.get_string("rs_event_id", ""); }
+
+std::vector<std::string> split_dash(const std::string& text) {
+    std::vector<std::string> parts;
+    std::string current;
+    for (char ch : text) {
+        if (ch == '-') {
+            parts.push_back(current);
+            current.clear();
+        } else {
+            current.push_back(ch);
+        }
+    }
+    parts.push_back(current);
+    return parts;
+}
+
+json::Value session_body(const Fake& fake) {
+    for (const Request& request : fake.requests()) {
+        if (ends_with(request.url, "/session")) {
+            return json::Value::parse(request.body);
+        }
+    }
+    return json::Value();
+}
+
+} // namespace
+
+RS_TEST(no_key_is_inert) {
+    auto fake = std::make_shared<Fake>();
+    auto logs = std::make_shared<LogLines>();
+    Config config = base_config(logs);
+    config.ingest_key = "";
+    config.track_lifecycle_events = true;
+    const std::string dir = config.storage_dir;
+    {
+        Client client(config, proxy(fake));
+        CHECK(client.status() == Status::no_key);
+        CHECK_EQ(std::string(to_string(client.status())), std::string("no_key"));
+        CHECK(!client.is_enabled());
+        CHECK(!client.is_collecting());
+        CHECK(!client.track("level_start", {{"level", 1}}));
+        client.flush();
+        const double before = wall_seconds();
+        CHECK(client.flush_and_wait(3.0));
+        CHECK(wall_seconds() - before < 0.5); // no worker to wait for
+        std::string feedback_code;
+        client.submit_feedback("hi", "bug", 3,
+                               [&](const FeedbackResult& result) { feedback_code = result.code; });
+        CHECK_EQ(feedback_code, std::string("no_key"));
+        bool suggestions_ok = true;
+        client.fetch_suggestions([&](bool ok, const json::Value&) { suggestions_ok = ok; });
+        CHECK(!suggestions_ok);
+        client.set_enabled(false);
+        client.set_enabled(true);
+        CHECK(client.device_id().empty());
+        CHECK(client.reset_device_id().empty());
+        sleep_seconds(0.2);
+        client.shutdown();
+    }
+    CHECK_EQ(fake->total(), std::size_t(0));
+    CHECK(files_in(dir).empty());
+    CHECK_EQ(logs->count_containing("no ingest_key, so analytics is off"), std::size_t(1));
+}
+
+RS_TEST(no_key_optional_is_silent_and_still_saves_the_choice) {
+    auto fake = std::make_shared<Fake>();
+    auto logs = std::make_shared<LogLines>();
+    Config config = base_config(logs);
+    config.ingest_key = "  ";
+    config.optional = true;
+    Client client(config, proxy(fake));
+    CHECK(client.status() == Status::no_key);
+    CHECK_EQ(logs->count_containing("no ingest_key"), std::size_t(0));
+    client.set_tracking_enabled(false);
+    CHECK(!client.is_tracking_enabled_by_player());
+    client.set_tracking_enabled(true);
+    CHECK(!client.track("x"));
+    sleep_seconds(0.1);
+    client.shutdown();
+    CHECK_EQ(fake->total(), std::size_t(0));
+    // Only the state file the player's choice asked for, no device id.
+    const std::vector<std::string> files = files_in(config.storage_dir);
+    CHECK_EQ(files.size(), std::size_t(1));
+    CHECK(files.empty() || files.front() == "state");
+}
+
+RS_TEST(opt_in_before_the_yes_does_nothing) {
+    auto fake = std::make_shared<Fake>();
+    Config config = base_config();
+    config.consent = Consent::opt_in;
+    config.track_lifecycle_events = true;
+    {
+        Client client(config, proxy(fake));
+        CHECK(!client.track("before_yes"));
+        client.flush();
+        bool suggestions_ok = true;
+        client.fetch_suggestions([&](bool ok, const json::Value&) { suggestions_ok = ok; });
+        CHECK(!suggestions_ok);
+        sleep_seconds(0.3);
+        CHECK(client.device_id().empty());
+        CHECK(client.status() == Status::disabled);
+        CHECK(!client.is_tracking_enabled_by_player());
+        CHECK(!client.is_collecting());
+        CHECK(client.reset_device_id().empty());
+    }
+    CHECK_EQ(fake->total(), std::size_t(0));
+    CHECK(files_in(config.storage_dir).empty());
+}
+
+RS_TEST(opt_in_after_the_yes_starts_and_queues_right_away) {
+    auto fake = std::make_shared<Fake>();
+    Config config = base_config();
+    config.consent = Consent::opt_in;
+    config.track_lifecycle_events = true;
+    Client client(config, proxy(fake));
+    CHECK(!client.track("before_yes"));
+    client.set_tracking_enabled(true);
+    CHECK(client.track("right_after_yes"));
+    CHECK(!client.device_id().empty());
+    std::string saved_id;
+    CHECK(detail::read_text_file(detail::join_path(config.storage_dir, "device_id"), saved_id));
+    CHECK_EQ(saved_id, client.device_id());
+    std::string state;
+    CHECK(detail::read_text_file(detail::join_path(config.storage_dir, "state"), state));
+    CHECK(state.find("opt_in=true") != std::string::npos);
+    CHECK(client.flush_and_wait(3.0));
+    const std::vector<std::string> names = fake->sent_event_names();
+    REQUIRE(names.size() == 2);
+    CHECK_EQ(names[0], std::string("game_started"));
+    CHECK_EQ(names[1], std::string("right_after_yes"));
+    const std::vector<Request> requests = fake->requests();
+    REQUIRE(!requests.empty());
+    CHECK(ends_with(requests.front().url, "/settings"));
+    CHECK(client.is_collecting());
+}
+
+RS_TEST(opt_in_revoke_keeps_the_device_id_and_a_saved_yes_starts_next_launch) {
+    auto fake = std::make_shared<Fake>();
+    Config config = base_config();
+    config.consent = Consent::opt_in;
+    std::string id;
+    {
+        Client client(config, proxy(fake));
+        client.set_tracking_enabled(true);
+        id = client.device_id();
+        CHECK(client.track("one"));
+        CHECK(client.flush_and_wait(3.0));
+    }
+    {
+        // A saved yes: the next launch starts at once with the same id.
+        Client client(config, proxy(fake));
+        CHECK(client.is_tracking_enabled_by_player());
+        CHECK_EQ(client.device_id(), id);
+        CHECK(client.track("two"));
+        CHECK(client.flush_and_wait(3.0));
+        const std::size_t before = fake->total();
+        client.set_tracking_enabled(false);
+        CHECK(!client.track("after_no"));
+        sleep_seconds(0.2);
+        CHECK_EQ(fake->total(), before);
+        std::string saved_id;
+        CHECK(detail::read_text_file(detail::join_path(config.storage_dir, "device_id"), saved_id));
+        CHECK_EQ(saved_id, id); // kept after the no
+        CHECK(client.reset_device_id().empty());
+        CHECK(!fs::exists(fs::path(detail::join_path(config.storage_dir, "device_id"))));
+    }
+    // The yes saved by opt_in does not read as an opt-out in the default mode.
+    Config plain = config;
+    plain.consent = Consent::opt_out;
+    CHECK(set_tracking_enabled(config, true));
+    Client client(plain, proxy(fake));
+    CHECK(client.is_tracking_enabled_by_player());
+}
+
+RS_TEST(distribution_is_sent_on_the_session_body) {
+    {
+        auto fake = std::make_shared<Fake>();
+        Config config = base_config();
+        config.distribution = "  steam-demo  ";
+        Client client(config, proxy(fake));
+        CHECK(client.track("x"));
+        CHECK(client.flush_and_wait(3.0));
+        CHECK_EQ(session_body(*fake).get_string("distribution", "?"), std::string("steam-demo"));
+    }
+    {
+        auto fake = std::make_shared<Fake>();
+        Config config = base_config();
+        config.distribution = std::string(40, 'y');
+        Client client(config, proxy(fake));
+        CHECK(client.track("x"));
+        CHECK(client.flush_and_wait(3.0));
+        CHECK_EQ(session_body(*fake).get_string("distribution", "?"), std::string(40, 'y'));
+    }
+    std::string emoji;
+    for (int i = 0; i < 21; ++i) {
+        emoji += "\xF0\x9F\x8E\xAE"; // one code point, two UTF-16 units
+    }
+    for (const std::string& bad : {std::string(41, 'x'), std::string("line\nbreak"),
+                                   std::string("del\x7f"), emoji}) {
+        auto fake = std::make_shared<Fake>();
+        auto logs = std::make_shared<LogLines>();
+        Config config = base_config(logs);
+        config.distribution = bad;
+        Client client(config, proxy(fake));
+        CHECK(client.track("x"));
+        CHECK(client.flush_and_wait(3.0));
+        CHECK(session_body(*fake).find("distribution") == nullptr);
+        client.shutdown();
+        CHECK_EQ(logs->count_containing("distribution must be at most 40"), std::size_t(1));
+    }
+    auto fake = std::make_shared<Fake>();
+    Client client(base_config(), proxy(fake));
+    CHECK(client.track("x"));
+    CHECK(client.flush_and_wait(3.0));
+    const json::Value body = session_body(*fake);
+    CHECK(body.find("distribution") == nullptr);
+    // A caller who passes only a key gets the 0.2.0 session body.
+    CHECK_EQ(body.members().size(), std::size_t(3));
+}
+
+RS_TEST(batch_403_ends_the_run) {
+    std::atomic<int> batches{0};
+    auto fake = std::make_shared<Fake>([&](const Request& request) {
+        if (ends_with(request.url, "/track/batch")) {
+            ++batches;
+            return reply(403, "{\"error\":\"forbidden\"}");
+        }
+        return default_routes(request);
+    });
+    Client client(base_config(), proxy(fake));
+    CHECK(client.track("x"));
+    client.flush_and_wait(3.0);
+    sleep_seconds(0.2);
+    CHECK(client.status() == Status::invalid_key);
+    CHECK_EQ(client.stats().queued, 0);
+    CHECK(!client.track("y"));
+    client.flush();
+    sleep_seconds(0.2);
+    client.shutdown();
+    CHECK_EQ(batches.load(), 1);
+}
+
+RS_TEST(rs_event_id_shape_prefix_and_resend) {
+    std::atomic<int> batches{0};
+    auto fake = std::make_shared<Fake>([&](const Request& request) {
+        if (ends_with(request.url, "/track/batch") && batches++ == 0) {
+            return reply(500, "{\"error\":\"internal_error\"}");
+        }
+        return default_routes(request);
+    });
+    Config config = base_config();
+    config.flush_interval_seconds = 0;
+    Client client(config, proxy(fake));
+    CHECK(client.track("a", {{"level", 1}}));
+    CHECK(client.track("b"));
+    client.flush_and_wait(3.0);       // the first batch fails with 500
+    CHECK(client.flush_and_wait(3.0)); // a forced resend
+    const std::vector<json::Value> data = sent_event_data(*fake);
+    REQUIRE(data.size() == 4);
+    CHECK_EQ(event_id_of(data[0]), event_id_of(data[2]));
+    CHECK_EQ(event_id_of(data[1]), event_id_of(data[3]));
+    CHECK(event_id_of(data[0]) != event_id_of(data[1]));
+    const std::regex shape("^[A-Za-z0-9_-]{1,64}$");
+    const std::regex nonce("^[0-9a-f]{8}$");
+    for (const json::Value& d : data) {
+        const std::string id = event_id_of(d);
+        CHECK(std::regex_match(id, shape));
+        const std::vector<std::string> parts = split_dash(id);
+        REQUIRE(parts.size() == 4);
+        CHECK_EQ(parts[0], client.device_id().substr(0, 16));
+        CHECK(std::regex_match(parts[2], nonce));
+    }
+    double level = 0;
+    CHECK(data[0].get_number("level", level));
+    CHECK_EQ(level, 1.0);
+}
+
+RS_TEST(rs_event_id_prefix_survives_a_relaunch) {
+    Config config = base_config();
+    std::string first;
+    {
+        auto fake = std::make_shared<Fake>();
+        Client client(config, proxy(fake));
+        CHECK(client.track("a"));
+        CHECK(client.flush_and_wait(3.0));
+        first = event_id_of(sent_event_data(*fake).at(0));
+    }
+    auto fake = std::make_shared<Fake>();
+    Client client(config, proxy(fake));
+    CHECK(client.track("a"));
+    CHECK(client.flush_and_wait(3.0));
+    const std::string second = event_id_of(sent_event_data(*fake).at(0));
+    CHECK_EQ(split_dash(first)[0], split_dash(second)[0]);
+    CHECK(split_dash(first)[2] != split_dash(second)[2]);
+
+    // A playtest id with characters outside the shape is made safe.
+    auto pt_fake = std::make_shared<Fake>();
+    Config pt = base_config();
+    pt.playtest_token = "ptk";
+    pt.playtest_run_id = "run.with spaces";
+    Client playtest(pt, proxy(pt_fake));
+    CHECK(playtest.track("p"));
+    CHECK(playtest.flush_and_wait(3.0));
+    const std::string pid = event_id_of(sent_event_data(*pt_fake).at(0));
+    CHECK(std::regex_match(pid, std::regex("^[A-Za-z0-9_-]{1,64}$")));
+}
+
+RS_TEST(event_over_8kb_is_dropped_with_one_warning) {
+    auto fake = std::make_shared<Fake>();
+    auto logs = std::make_shared<LogLines>();
+    Client client(base_config(logs), proxy(fake));
+    CHECK(!client.track("huge", {{"blob", std::string(8200, 'x')}}));
+    CHECK(!client.track("huge_again", {{"blob", std::string(9000, 'x')}}));
+    CHECK_EQ(client.stats().dropped, 2);
+    CHECK_EQ(client.stats().last_error, std::string("event_too_large"));
+    CHECK_EQ(client.stats().queued, 0);
+    CHECK(client.track("fits", {{"blob", std::string(8000, 'x')}}));
+    CHECK(client.flush_and_wait(3.0));
+    client.shutdown();
+    const std::vector<std::string> names = fake->sent_event_names();
+    REQUIRE(names.size() == 1);
+    CHECK_EQ(names[0], std::string("fits"));
+    CHECK_EQ(logs->count_containing("larger than 8192 bytes"), std::size_t(1));
+}
+
+RS_TEST(a_key_only_client_writes_only_the_device_id) {
+    auto fake = std::make_shared<Fake>();
+    Config config = base_config();
+    {
+        Client client(config, proxy(fake));
+        CHECK(client.track("x"));
+        CHECK(client.flush_and_wait(3.0));
+    }
+    const std::vector<std::string> files = files_in(config.storage_dir);
+    REQUIRE(files.size() == 1);
+    CHECK_EQ(files[0], std::string("device_id"));
+}
+
+RS_TEST(random_unit_draws_stay_in_range) {
+    for (int i = 0; i < 2000; ++i) {
+        const double draw = detail::random_unit();
+        CHECK(draw >= 0.0 && draw < 1.0);
+    }
+    CHECK_EQ(detail::random_hex(4).size(), std::size_t(8));
 }

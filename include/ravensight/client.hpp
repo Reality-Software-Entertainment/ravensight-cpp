@@ -71,12 +71,14 @@ inline constexpr std::array<std::string_view, 6> feedback_categories{
 enum class Status {
     /// Sending normally, or about to (no failure seen).
     ok,
-    /// Turned off by Config::enabled, set_enabled(false) or the player's
-    /// saved opt-out (set_tracking_enabled(false)).
+    /// Turned off by Config::enabled, set_enabled(false), the player's
+    /// saved opt-out (set_tracking_enabled(false)), or Consent::opt_in with
+    /// no yes from the player yet.
     disabled,
     /// The ingest key was refused (401, or a 403 that is not one of the
-    /// codes below). Automatic sending stops for the run; events still
-    /// queue and an explicit flush() makes one more attempt.
+    /// codes below) by the settings check, the session, a batch, feedback
+    /// or suggestions. The run ends: the queue is cleared and nothing more
+    /// is sent or retried, not even on an explicit flush().
     invalid_key,
     /// The server kill switch: GET /settings said trackingEnabled false, or
     /// a request answered 403 tracking_disabled. Stops for the run.
@@ -90,6 +92,21 @@ enum class Status {
     session_failed,
     /// The playtest job this run belongs to has finished. Stops for the run.
     playtest_job_closed,
+    /// Config::ingest_key was empty: the client is inert for its lifetime
+    /// (no files, no requests, no worker thread).
+    no_key,
+};
+
+/// When the client may start collecting.
+enum class Consent {
+    /// The default: collecting until the player opts out with
+    /// set_tracking_enabled(false), which is saved.
+    opt_out,
+    /// Nothing at all until the player says yes with
+    /// set_tracking_enabled(true): no device id, no settings check, no
+    /// session. Events tracked before the yes are dropped. The yes is saved
+    /// in the state file.
+    opt_in,
 };
 
 /// The reason code as text: "disabled", "invalid_key" and so on, or an
@@ -97,8 +114,26 @@ enum class Status {
 const char* to_string(Status status);
 
 struct Config {
-    /// Your publishable ingest key, format gt_live_... Required.
+    /// Your publishable ingest key, gt_live_... or, for a build anyone can
+    /// download, a public gt_pub_... key injected at build time. Empty makes
+    /// the client inert: it writes no files, makes no request, starts no
+    /// thread, and every call is a quiet no-op. status() is Status::no_key.
     std::string ingest_key;
+
+    /// True silences the one warning an inert client (no key) logs.
+    bool optional = false;
+
+    /// Consent::opt_in sends nothing, and makes no device id, until the
+    /// player's set_tracking_enabled(true). The default keeps the 0.2.0
+    /// behaviour.
+    Consent consent = Consent::opt_out;
+
+    /// A short label of your own for this build, such as "steam-release"
+    /// or "itch-demo", sent on POST /session as distribution. At most 40
+    /// characters (UTF-16 units, as the server counts), no control
+    /// characters, surrounding whitespace trimmed; anything else is not sent
+    /// and logs one warning. Empty sends nothing.
+    std::string distribution;
 
     /// Base URL. Trailing slashes and a trailing "/api/v1" are accepted and
     /// normalized; empty means the default. Only change this if you self host.
@@ -227,8 +262,9 @@ bool apply_playtest_args(Config& config, int argc, const char* const* argv);
 
 class Client {
 public:
-    /// Starts the worker thread using the built in libcurl transport.
-    /// Throws std::invalid_argument when the ingest key is empty.
+    /// Starts the worker thread using the built in libcurl transport. With
+    /// an empty ingest key the client is inert instead: no thread, no
+    /// transport, no files, one warning (unless Config::optional).
     explicit Client(Config config);
 
     /// Same, with a caller supplied transport. Used by the unit tests.
@@ -244,11 +280,15 @@ public:
 
     /// Queues an event. Never sends by itself: the worker sends on its timer,
     /// as soon as 50 events are queued, and on flush and shutdown. Returns
-    /// false when the client is not sending (see status()) or shutting down.
+    /// false when the client is not sending (see status()) or shutting down,
+    /// and when the event's data is over limits::max_event_bytes as JSON
+    /// (dropped, counted in stats().dropped, last_error "event_too_large",
+    /// one warning for the run). Every queued event's data carries an
+    /// rs_event_id, so a resend can be recognised by the server.
     bool track(const std::string& event_name, const EventData& data = {});
 
     /// Asks the worker to flush now instead of waiting for the timer.
-    /// Non blocking. After a refused key this makes one more attempt.
+    /// Non blocking.
     void flush();
 
     /// Flushes and waits until the queue drains or timeout_seconds passes.
@@ -279,22 +319,38 @@ public:
     /// discards anything still queued. Enabling a client that started
     /// disabled runs the settings check and queues game_started then.
     void set_enabled(bool enabled);
+    /// The game's own switch (Config::enabled, set_enabled). Always false
+    /// for an inert client with no key.
     bool is_enabled() const;
+
+    /// True only while the client is collecting: it has a key, and nobody
+    /// switched it off (the game, the player, Consent::opt_in without a
+    /// yes, the server, or a refused key). Use it to skip work that only
+    /// feeds analytics.
+    bool is_collecting() const;
 
     /// The player's choice, saved to state_file at once and read by every
     /// later Client. Turning it off discards the queue and stops sending.
+    /// With Consent::opt_in, true is the yes that starts everything (the
+    /// first moment a device id exists), and events tracked right after it
+    /// are queued while the settings check runs; false again keeps the
+    /// device id (reset_device_id forgets it). The choice is saved while
+    /// inert or after a refused key too, but nothing restarts this run.
     /// A no-op that logs one line during a playtest run.
     void set_tracking_enabled(bool enabled);
 
-    /// False when the player has opted out with set_tracking_enabled(false).
+    /// False when the player has opted out with set_tracking_enabled(false),
+    /// or with Consent::opt_in has not said yes.
     bool is_tracking_enabled_by_player() const;
 
     /// Mints and saves a new random device id, discards the queue and drops
     /// the session, so nothing links the old id to the new one. While the
     /// client is disabled or opted out the old saved id is deleted and the
     /// new one is saved once the client may send again. Returns the
-    /// new id. A no-op that logs one line during a playtest run (it returns
-    /// the current id).
+    /// new id. With Consent::opt_in and no yes, the saved id is deleted and
+    /// none is made: it returns an empty string. A no-op that logs one line
+    /// during a playtest run (it returns the current id), and a no-op on an
+    /// inert client.
     std::string reset_device_id();
 
     // --- State -------------------------------------------------------------
@@ -304,8 +360,8 @@ public:
     Status status() const;
 
     /// False once sending stopped for the rest of the run: the server kill
-    /// switch (GET /settings or a 403 tracking_disabled) or a closed or
-    /// invalid playtest. status() says which.
+    /// switch (GET /settings or a 403 tracking_disabled), a refused key, or
+    /// a closed or invalid playtest. status() says which.
     bool tracking_enabled() const;
 
     /// True once a valid session token is held.
@@ -318,7 +374,9 @@ public:
     /// True when this run is a Ravensight Playtest run (a token was found).
     bool is_playtest() const;
 
-    /// The device id in use. "pt-<run id>" during a playtest run.
+    /// The device id in use. "pt-<run id>" during a playtest run. Empty on
+    /// an inert client with none saved, and with Consent::opt_in before the
+    /// first yes.
     std::string device_id() const;
     const std::string& api_url() const { return api_url_; }
 

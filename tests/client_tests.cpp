@@ -143,16 +143,18 @@ Config test_config() {
 
 } // namespace
 
-RS_TEST(client_requires_an_ingest_key) {
+RS_TEST(client_without_an_ingest_key_is_inert_not_an_error) {
     Config config = test_config();
     config.ingest_key = "  ";
     bool threw = false;
     try {
         Client client(config, std::make_unique<FakeTransport>(&default_routes));
-    } catch (const std::invalid_argument&) {
+        CHECK(client.status() == Status::no_key);
+        CHECK(!client.track("x"));
+    } catch (...) {
         threw = true;
     }
-    CHECK(threw);
+    CHECK(!threw);
 }
 
 RS_TEST(client_normalizes_api_urls) {

@@ -2,13 +2,16 @@
 
 #include "storage.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <cstring>
 #include <iterator>
+#include <random>
 #include <system_error>
 
 #if defined(_WIN32)
@@ -153,6 +156,40 @@ bool os_random_bytes(unsigned char* out, std::size_t n) {
     std::fclose(file);
     return got == n;
 #endif
+}
+
+void random_bytes(unsigned char* out, std::size_t n) {
+    if (os_random_bytes(out, n)) {
+        return;
+    }
+    // Last resort: independent 32 bit draws, never one seed.
+    std::random_device device;
+    for (std::size_t i = 0; i < n; i += 4) {
+        const std::uint32_t value = static_cast<std::uint32_t>(device());
+        std::memcpy(out + i, &value, std::min<std::size_t>(4, n - i));
+    }
+}
+
+std::string random_hex(std::size_t bytes) {
+    std::string out;
+    out.reserve(bytes * 2);
+    static const char hex[] = "0123456789abcdef";
+    for (std::size_t i = 0; i < bytes; ++i) {
+        unsigned char byte = 0;
+        random_bytes(&byte, 1);
+        out.push_back(hex[byte >> 4]);
+        out.push_back(hex[byte & 0xF]);
+    }
+    return out;
+}
+
+double random_unit() {
+    unsigned char bytes[8];
+    random_bytes(bytes, sizeof(bytes));
+    std::uint64_t value = 0;
+    std::memcpy(&value, bytes, sizeof(value));
+    // The top 53 bits, so the result is exactly representable and below 1.
+    return static_cast<double>(value >> 11) * (1.0 / 9007199254740992.0);
 }
 
 // --- Paths and files ----------------------------------------------------------

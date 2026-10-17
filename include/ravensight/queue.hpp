@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,14 @@ inline constexpr double session_expiry_skew_seconds = 5.0;
 
 /// Floor on any scheduled retry wait, so a zero delay never busy loops.
 inline constexpr double min_retry_seconds = 0.5;
+
+/// Backoff waits are spread by plus or minus this fraction, so many games
+/// that failed together do not retry together. Retry-After is never spread.
+inline constexpr double backoff_jitter = 0.2;
+
+/// The largest event the API accepts: its data serialized as JSON. Bigger
+/// events are dropped before they are queued.
+inline constexpr std::size_t max_event_bytes = 8192;
 
 } // namespace limits
 
@@ -203,13 +212,20 @@ public:
     /// Back to the 10 second first delay, with no pending retry window.
     void reset_backoff();
 
-    /// Opens a retry window of the current backoff, then doubles it up to the ceiling.
+    /// Opens a retry window of the current backoff, spread by plus or minus
+    /// backoff_jitter when a random source is set (never past the ceiling),
+    /// then doubles the backoff up to the ceiling.
     void schedule_backoff(double now_seconds);
+
+    /// A source of draws in [0, 1) for the backoff jitter. Unset (the
+    /// default for a bare Queue) means no spread, so the state machine stays
+    /// deterministic; the Client sets the operating system's random source.
+    void set_random_source(std::function<double()> draw) { random_ = std::move(draw); }
 
     /// 0 when a request may go out now, otherwise the wait remaining.
     double seconds_until_next_attempt(double now_seconds) const;
 
-    /// The delay the next schedule_backoff would use.
+    /// The delay the next schedule_backoff would use, before any jitter.
     double backoff_seconds() const { return backoff_seconds_; }
 
     /// seconds_until_next_attempt raised to min_retry_seconds, for handing
@@ -242,6 +258,7 @@ private:
 
     double next_attempt_at_seconds_ = 0.0;
     double backoff_seconds_ = limits::default_retry_seconds;
+    std::function<double()> random_;
     int batch_limit_ = limits::max_batch_size;
 
     int sent_count_ = 0;

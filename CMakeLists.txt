@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ravensight
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Official C++ SDK for Ravensight player analytics"
     HOMEPAGE_URL "https://ravensight.io"
     LANGUAGES CXX)

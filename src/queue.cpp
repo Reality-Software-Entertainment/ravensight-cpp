@@ -176,7 +176,13 @@ void Queue::reset_backoff() {
 }
 
 void Queue::schedule_backoff(double now_seconds) {
-    next_attempt_at_seconds_ = now_seconds + backoff_seconds_;
+    double wait = backoff_seconds_;
+    if (random_) {
+        const double draw = std::min(std::max(random_(), 0.0), 1.0);
+        const double factor = 1.0 - limits::backoff_jitter + 2.0 * limits::backoff_jitter * draw;
+        wait = std::min(backoff_seconds_ * factor, limits::max_backoff_seconds);
+    }
+    next_attempt_at_seconds_ = now_seconds + wait;
     backoff_seconds_ = std::min(backoff_seconds_ * 2.0, limits::max_backoff_seconds);
 }
 

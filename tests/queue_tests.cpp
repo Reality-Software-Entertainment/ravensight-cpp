@@ -3,6 +3,7 @@
 // Unit tests for the protocol state machine. Every clock reading is passed
 // in explicitly, so each retry path is exercised deterministically.
 
+#include <cstdlib>
 #include <string>
 
 #include "ravensight/queue.hpp"
@@ -351,4 +352,50 @@ RS_TEST(bad_request_single_event_is_dropped_and_counted) {
     CHECK_EQ(queue.count(), 1);
     CHECK_EQ(queue.stats().dropped, 1);
     CHECK_EQ(queue.events().front().name, std::string("event_1"));
+}
+
+// --- Backoff jitter (0.3.0) -------------------------------------------------------
+
+RS_TEST(backoff_jitter_bounds) {
+    Queue low;
+    low.set_random_source([] { return 0.0; });
+    low.schedule_backoff(100.0);
+    CHECK_EQ(low.seconds_until_next_attempt(100.0), 8.0);
+    CHECK_EQ(low.backoff_seconds(), 20.0); // the doubling is not spread
+
+    Queue high;
+    high.set_random_source([] { return 1.0; });
+    high.schedule_backoff(100.0);
+    CHECK_EQ(high.seconds_until_next_attempt(100.0), 12.0);
+
+    Queue mid;
+    mid.set_random_source([] { return 0.5; });
+    mid.schedule_backoff(100.0);
+    CHECK_EQ(mid.seconds_until_next_attempt(100.0), 10.0); // a fixed draw keeps 0.2.0's wait
+
+    // Never past the ceiling.
+    Queue capped;
+    capped.set_random_source([] { return 1.0; });
+    for (int i = 0; i < 10; ++i) {
+        capped.schedule_backoff(100.0);
+    }
+    CHECK(capped.seconds_until_next_attempt(100.0) <= limits::max_backoff_seconds);
+    CHECK_EQ(capped.seconds_until_next_attempt(100.0), limits::max_backoff_seconds);
+
+    // A real source stays inside plus or minus 20 percent.
+    Queue spread;
+    spread.set_random_source([] { return static_cast<double>(std::rand()) / (RAND_MAX + 1.0); });
+    for (int i = 0; i < 200; ++i) {
+        spread.reset_backoff();
+        spread.schedule_backoff(0.0);
+        const double wait = spread.seconds_until_next_attempt(0.0);
+        CHECK(wait >= 8.0 && wait <= 12.0);
+    }
+}
+
+RS_TEST(retry_after_is_not_jittered) {
+    Queue queue;
+    queue.set_random_source([] { return 0.0; });
+    queue.on_rate_limited(100.0, 30.0);
+    CHECK_EQ(queue.seconds_until_next_attempt(100.0), 30.0);
 }

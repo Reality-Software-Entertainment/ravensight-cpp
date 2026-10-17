@@ -13,7 +13,6 @@
 #include <future>
 #include <mutex>
 #include <random>
-#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -172,20 +171,93 @@ PlaytestContext resolve_playtest(const Config& config) {
 }
 
 const char* const opted_out_line = "tracking_enabled=false";
+// Written beside "tracking_enabled=true" only for the yes of Consent::opt_in.
+const char* const opted_in_line = "opt_in=true";
 
-bool read_opted_out(const std::string& state_file) {
-    if (state_file.empty()) {
-        return false;
-    }
+/// The player's saved choice for the consent mode: true when tracking may
+/// run. opt_out: on unless an opt-out was saved. opt_in: off unless a yes
+/// was saved.
+bool read_allowed(const std::string& state_file, Consent consent) {
     std::string text;
-    if (!detail::read_text_file(state_file, text)) {
-        return false;
+    const bool has = !state_file.empty() && detail::read_text_file(state_file, text);
+    if (consent == Consent::opt_in) {
+        return has && text.find(opted_in_line) != std::string::npos;
     }
-    return text.find(opted_out_line) != std::string::npos;
+    return !(has && text.find(opted_out_line) != std::string::npos);
 }
 
-std::string state_text(bool enabled) {
-    return enabled ? "tracking_enabled=true\n" : std::string(opted_out_line) + "\n";
+std::string state_text(bool enabled, Consent consent) {
+    if (!enabled) {
+        return std::string(opted_out_line) + "\n";
+    }
+    return consent == Consent::opt_in ? "tracking_enabled=true\n" + std::string(opted_in_line) + "\n"
+                                      : std::string("tracking_enabled=true\n");
+}
+
+/// The length of a UTF-8 string in UTF-16 units, which is how the server
+/// counts characters.
+std::size_t utf16_length(const std::string& text) {
+    std::size_t units = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if ((c & 0xC0) == 0x80) {
+            continue; // continuation byte
+        }
+        units += c >= 0xF0 ? 2 : 1;
+    }
+    return units;
+}
+
+constexpr std::size_t max_distribution_length = 40;
+
+/// The distribution option, trimmed, when it is valid; empty otherwise (and
+/// invalid set when there was something that could not be sent).
+std::string validated_distribution(const std::string& raw, bool& invalid) {
+    invalid = false;
+    const std::string label = detail::trim(raw);
+    if (label.empty()) {
+        return "";
+    }
+    bool control = false;
+    for (char ch : label) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c < 0x20 || c == 0x7F) {
+            control = true;
+        }
+    }
+    if (control || utf16_length(label) > max_distribution_length) {
+        invalid = true;
+        return "";
+    }
+    return label;
+}
+
+/// rs_event_id from its parts: the first 16 characters of the device id
+/// (anything outside A-Z, a-z, 0-9, _ and - replaced with _), the start
+/// time in hex, the per-launch nonce and the counter.
+std::string make_event_id(const std::string& device_id, long long start_unix,
+                          const std::string& nonce, unsigned long long counter) {
+    std::string prefix = device_id.substr(0, 16);
+    for (char& ch : prefix) {
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+        if (!ok) {
+            ch = '_';
+        }
+    }
+    char start[32];
+    std::snprintf(start, sizeof(start), "%llx", static_cast<unsigned long long>(start_unix));
+    return prefix + "-" + start + "-" + nonce + "-" + std::to_string(counter);
+}
+
+/// Adds one already serialized "key":value member to a JSON object literal.
+void append_member(std::string& object_json, const std::string& member) {
+    if (object_json.size() <= 2) {
+        object_json = "{" + member + "}";
+    } else {
+        object_json.pop_back();
+        object_json += "," + member + "}";
+    }
 }
 
 bool is_feedback_category(const std::string& category) {
@@ -222,6 +294,8 @@ const char* to_string(Status status) {
             return "session_failed";
         case Status::playtest_job_closed:
             return "playtest_job_closed";
+        case Status::no_key:
+            return "no_key";
     }
     return "";
 }
@@ -260,7 +334,7 @@ bool set_tracking_enabled(const Config& config, bool enabled) {
     if (paths.state_file.empty()) {
         return false;
     }
-    return detail::write_text_file(paths.state_file, state_text(enabled));
+    return detail::write_text_file(paths.state_file, state_text(enabled, config.consent));
 }
 
 bool apply_playtest_args(Config& config, int argc, const char* const* argv) {
@@ -324,6 +398,39 @@ public:
         queue_.set_max_queue_size(config_.max_queue_size);
         join_token_ = detail::trim(config_.join_token);
         enabled_ = config_.enabled;
+        consent_ = config_.consent;
+        start_unix_ = static_cast<long long>(now_unix_seconds());
+
+        if (detail::trim(config_.ingest_key).empty()) {
+            // A keyless clone or a development build: inert, not an error.
+            // No worker thread, no transport, no file written; the paths are
+            // kept only so the player's choice can still be saved.
+            inert_ = true;
+            paths_ = resolve_paths(config_);
+            opted_out_ = !read_allowed(paths_.state_file, consent_);
+            apply_local_state_locked();
+            if (!config_.optional) {
+                const std::string line =
+                    "Ravensight: no ingest_key, so analytics is off for this run "
+                    "(set Config::optional to silence this line)";
+                if (config_.log) {
+                    config_.log(line);
+                } else {
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+            }
+            return;
+        }
+
+        queue_.set_random_source(&detail::random_unit);
+        event_nonce_ = detail::random_hex(4);
+        bool bad_distribution = false;
+        distribution_ = validated_distribution(config_.distribution, bad_distribution);
+        if (bad_distribution) {
+            note_locked("distribution must be at most 40 characters with no control characters; "
+                        "it is not sent",
+                        true);
+        }
 
         const PlaytestContext playtest = resolve_playtest(config_);
         playtest_token_ = playtest.token;
@@ -341,7 +448,7 @@ public:
             }
         } else {
             paths_ = resolve_paths(config_);
-            opted_out_ = read_opted_out(paths_.state_file);
+            opted_out_ = !read_allowed(paths_.state_file, consent_);
             if (!config_.device_id.empty()) {
                 device_id_ = config_.device_id;
                 device_id_saved_ = true;
@@ -352,8 +459,10 @@ public:
                     !detail::trim(saved).empty()) {
                     device_id_ = detail::trim(saved);
                     device_id_saved_ = true;
-                } else {
+                } else if (!(consent_ == Consent::opt_in && opted_out_)) {
                     // Saved only once the client is enabled and opted in.
+                    // With Consent::opt_in and no yes, none is made at all
+                    // (on_locally_enabled_locked makes it on the yes).
                     device_id_ = generate_device_id();
                 }
             }
@@ -381,10 +490,11 @@ public:
         if (shutdown_requested_ || !queue_.is_active()) {
             return false;
         }
-        enqueue_locked(std::move(event));
-        // A full batch goes out now rather than on the timer, except while
-        // the key is refused (only an explicit flush retries then).
-        if (queue_.count() >= limits::max_batch_size && !invalid_key_) {
+        if (!enqueue_locked(std::move(event))) {
+            return false;
+        }
+        // A full batch goes out now rather than on the timer.
+        if (queue_.count() >= limits::max_batch_size) {
             wake_ = true;
             cv_.notify_all();
         }
@@ -398,9 +508,12 @@ public:
     }
 
     bool flush_and_wait(double timeout_seconds) {
+        if (inert_) {
+            return true;
+        }
         if (std::this_thread::get_id() == worker_.get_id()) {
             // Called from a callback on the worker itself: run inline.
-            flush_cycle(true, true);
+            flush_cycle(true);
             std::lock_guard<std::mutex> lock(mutex_);
             return queue_.is_empty();
         }
@@ -413,7 +526,7 @@ public:
                 return queue_.is_empty();
             }
             commands_.push_back([this, done] {
-                flush_cycle(true, true);
+                flush_cycle(true);
                 bool empty;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -468,7 +581,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!shutdown_requested_ && queue_.is_active() && !invalid_key_) {
+            if (!shutdown_requested_ && queue_.is_active()) {
                 commands_.push_back([this, callback] { run_suggestions(callback); });
                 cv_.notify_all();
                 return;
@@ -491,7 +604,12 @@ public:
 
     bool is_enabled() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return enabled_;
+        return enabled_ && !inert_;
+    }
+
+    bool is_collecting() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.is_active();
     }
 
     void set_tracking_enabled(bool enabled) {
@@ -503,7 +621,7 @@ public:
         }
         // Written synchronously, so it holds even if the game quits next.
         const bool saved = !paths_.state_file.empty() &&
-                           detail::write_text_file(paths_.state_file, state_text(enabled));
+                           detail::write_text_file(paths_.state_file, state_text(enabled, consent_));
 
         std::lock_guard<std::mutex> lock(mutex_);
         if (!saved) {
@@ -531,6 +649,22 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (is_playtest_) {
             note_locked("reset_device_id ignored during a playtest run", false);
+            schedule_settings_check_locked();
+            return device_id_;
+        }
+        if (inert_) {
+            return device_id_;
+        }
+        if (consent_ == Consent::opt_in && opted_out_ && config_.device_id.empty()) {
+            // Not opted in: forget any old id and make none until the yes.
+            if (!paths_.device_file.empty() && !detail::remove_file(paths_.device_file)) {
+                note_locked("could not delete the saved device id at " + paths_.device_file, true);
+            }
+            device_id_.clear();
+            device_id_saved_ = false;
+            queue_.clear();
+            queue_.invalidate_session();
+            ++identity_generation_;
             schedule_settings_check_locked();
             return device_id_;
         }
@@ -588,7 +722,7 @@ public:
         Stats out;
         out.queued = qs.queued;
         out.sent = qs.sent;
-        out.dropped = qs.dropped;
+        out.dropped = qs.dropped + too_large_dropped_;
         out.batches = qs.batches;
         out.sessions = qs.sessions;
         out.last_error = last_error_;
@@ -640,14 +774,14 @@ private:
     }
 
     Status compute_status_locked() const {
+        if (inert_) {
+            return Status::no_key;
+        }
         if (!enabled_ || opted_out_) {
             return Status::disabled;
         }
         if (stopped_) {
             return stop_reason_;
-        }
-        if (invalid_key_) {
-            return Status::invalid_key;
         }
         return transient_;
     }
@@ -673,12 +807,17 @@ private:
     // --- Local state --------------------------------------------------------
 
     void apply_local_state_locked() {
-        queue_.set_locally_enabled(enabled_ && !opted_out_);
+        queue_.set_locally_enabled(!inert_ && enabled_ && !opted_out_);
     }
 
     // The client just became able to send: save the id it will use and queue
-    // game_started once per run.
+    // game_started once per run. With Consent::opt_in this is the first
+    // moment a device id exists.
     void on_locally_enabled_locked() {
+        if (device_id_.empty()) {
+            device_id_ = generate_device_id();
+            device_id_saved_ = false;
+        }
         persist_device_id_locked();
         if (config_.track_lifecycle_events && !started_queued_ && queue_.is_active()) {
             started_queued_ = true;
@@ -715,6 +854,9 @@ private:
     // Pokes the worker to run the settings check (when it has not run and
     // the client may send) and to report any status change.
     void schedule_settings_check_locked() {
+        if (inert_) {
+            return; // no worker to run it
+        }
         commands_.push_back([this] { maybe_check_settings(); });
         cv_.notify_all();
     }
@@ -731,19 +873,35 @@ private:
         return tags;
     }
 
-    void enqueue_locked(Event event) {
+    // Adds the playtest tags and the rs_event_id, then queues the event.
+    // Returns false when its data is over limits::max_event_bytes as JSON:
+    // it is dropped and never sent.
+    bool enqueue_locked(Event event) {
         if (!playtest_tags_.empty()) {
-            if (event.data_json.size() <= 2) {
-                event.data_json = "{" + playtest_tags_ + "}";
-            } else {
-                event.data_json.pop_back();
-                event.data_json += "," + playtest_tags_ + "}";
+            append_member(event.data_json, playtest_tags_);
+        }
+        ++event_counter_;
+        append_member(event.data_json,
+                      "\"rs_event_id\":" +
+                          json::escape_string(make_event_id(device_id_, start_unix_, event_nonce_,
+                                                            event_counter_)));
+        if (event.data_json.size() > limits::max_event_bytes) {
+            ++too_large_dropped_;
+            last_error_ = "event_too_large";
+            if (!too_large_warned_) {
+                too_large_warned_ = true;
+                note_locked("dropped event \"" + event.name + "\": larger than " +
+                                std::to_string(limits::max_event_bytes) +
+                                " bytes as JSON (further drops are not logged)",
+                            true);
             }
+            return false;
         }
         const int dropped = queue_.enqueue(std::move(event));
         if (dropped > 0) {
             note_locked("queue full, dropped " + std::to_string(dropped) + " oldest event(s)", false);
         }
+        return true;
     }
 
     // --- Failure handling ---------------------------------------------------
@@ -761,16 +919,13 @@ private:
         note_locked(message, true);
     }
 
+    // The key itself was refused (revoked, rotated, wrong). Retrying cannot
+    // help, so the run ends here: the queue is cleared, nothing more is
+    // sent or retried, and nothing is flushed at shutdown.
     void refuse_key_locked() {
-        invalid_key_ = true;
-        last_error_ = "invalid_key";
-        queue_.invalidate_session();
-        if (!invalid_key_warned_) {
-            invalid_key_warned_ = true;
-            note_locked("ingest key refused (invalid_key), sending stopped for this run. "
-                        "Check your gt_live_ key.",
-                        true);
-        }
+        stop_locked(Status::invalid_key, "invalid_key",
+                    "ingest key refused (invalid_key), sending stopped for this run. "
+                    "Check your gt_live_ key.");
     }
 
     // Handles a 401 or 403 from an endpoint authenticated by the ingest key
@@ -885,15 +1040,15 @@ private:
     }
 
     // Returns true when a valid session is held on exit. force ignores the
-    // retry window; explicit_attempt also allows one attempt after a refused
-    // key. Neither ever ignores the kill switch or an opt-out.
-    bool ensure_session(bool force, bool explicit_attempt) {
+    // retry window. It never ignores the kill switch, a refused key or an
+    // opt-out.
+    bool ensure_session(bool force) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (queue_.is_session_valid(now_unix_seconds())) {
                 return true;
             }
-            if (!queue_.is_active() || (invalid_key_ && !explicit_attempt)) {
+            if (!queue_.is_active()) {
                 return false;
             }
             if (!force && queue_.seconds_until_next_attempt(now_unix_seconds()) > 0.0) {
@@ -919,6 +1074,9 @@ private:
             body.add("platform", platform_);
             if (!join_token.empty()) {
                 body.add("joinToken", join_token);
+            }
+            if (!distribution_.empty()) {
+                body.add("distribution", distribution_);
             }
 
             Request request = make_request("POST", "/session", true);
@@ -958,7 +1116,6 @@ private:
                 if (join_token_ == join_token) {
                     join_token_.clear();
                 }
-                invalid_key_ = false;
                 transient_ = Status::ok;
                 note_locked("session ready", false);
                 return true;
@@ -1008,7 +1165,7 @@ private:
     // Sends batches of up to 50 until the queue drains or the server asks us
     // to back off. Events leave the queue only once the server accepts them
     // (or refuses a single one outright with 400).
-    void flush_cycle(bool force, bool explicit_attempt) {
+    void flush_cycle(bool force) {
         maybe_check_settings();
 
         int reauth_attempts = 0;
@@ -1022,9 +1179,6 @@ private:
             std::string token;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (invalid_key_ && !explicit_attempt) {
-                    return;
-                }
                 plan = queue_.begin_flush(now_unix_seconds(), force);
                 token = queue_.session_token();
             }
@@ -1034,7 +1188,7 @@ private:
                 if (++session_attempts > 3) {
                     return;
                 }
-                if (!ensure_session(force, explicit_attempt)) {
+                if (!ensure_session(force)) {
                     return;
                 }
                 continue;
@@ -1130,7 +1284,7 @@ private:
             fail(current_failure(), 0);
             return;
         }
-        if (!ensure_session(true, true)) {
+        if (!ensure_session(true)) {
             fail(current_failure(), 0);
             return;
         }
@@ -1151,7 +1305,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 queue_.invalidate_session();
             }
-            if (!ensure_session(true, true)) {
+            if (!ensure_session(true)) {
                 fail(current_failure(), 0);
                 return;
             }
@@ -1196,7 +1350,7 @@ private:
         bool may_send;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            may_send = queue_.is_active() && !invalid_key_;
+            may_send = queue_.is_active();
         }
         if (!may_send) {
             callback(false, empty_array());
@@ -1265,7 +1419,7 @@ private:
                 break;
             }
             if (config_.flush_interval_seconds > 0.0 || force || wake) {
-                flush_cycle(force, force);
+                flush_cycle(force);
             }
             update_status();
         }
@@ -1282,7 +1436,7 @@ private:
                 enqueue_locked(std::move(event));
             }
         }
-        flush_cycle(true, false);
+        flush_cycle(true);
         update_status();
     }
 
@@ -1309,7 +1463,6 @@ private:
     bool device_id_saved_ = false;
     bool enabled_ = true;
     bool opted_out_ = false;
-    bool invalid_key_ = false;
     bool stopped_ = false;
     Status stop_reason_ = Status::ok;
     Status transient_ = Status::ok;
@@ -1317,8 +1470,15 @@ private:
     bool settings_checked_ = false;
     bool started_queued_ = false;
     bool exited_queued_ = false;
-    bool invalid_key_warned_ = false;
     bool bad_event_warned_ = false;
+    bool too_large_warned_ = false;
+    int too_large_dropped_ = 0;
+    bool inert_ = false;
+    Consent consent_ = Consent::opt_out;
+    std::string distribution_;
+    std::string event_nonce_;
+    unsigned long long event_counter_ = 0;
+    long long start_unix_ = 0;
     bool storage_warned_ = false;
     unsigned long long identity_generation_ = 0;
     bool nudge_ = false;
@@ -1334,11 +1494,8 @@ Client::Client(Config config)
     : Client(std::move(config), nullptr) {}
 
 Client::Client(Config config, std::unique_ptr<Transport> transport) {
-    if (detail::trim(config.ingest_key).empty()) {
-        throw std::invalid_argument(
-            "Ravensight: ingest_key is required (your gt_live_... key)");
-    }
-    if (!transport) {
+    // No key: inert, so no transport is made (libcurl is never touched).
+    if (!transport && !detail::trim(config.ingest_key).empty()) {
         transport = std::make_unique<CurlTransport>(config.request_timeout_seconds);
     }
     api_url_ = normalize_api_url(config.api_url);
@@ -1368,6 +1525,7 @@ void Client::fetch_suggestions(SuggestionsCallback callback) {
 
 void Client::set_enabled(bool enabled) { impl_->set_enabled(enabled); }
 bool Client::is_enabled() const { return impl_->is_enabled(); }
+bool Client::is_collecting() const { return impl_->is_collecting(); }
 void Client::set_tracking_enabled(bool enabled) { impl_->set_tracking_enabled(enabled); }
 bool Client::is_tracking_enabled_by_player() const { return impl_->is_tracking_enabled_by_player(); }
 std::string Client::reset_device_id() { return impl_->reset_device_id(); }
