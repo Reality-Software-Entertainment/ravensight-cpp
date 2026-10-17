@@ -10,15 +10,16 @@ for transport; JSON is handled by the SDK's own tiny writer and reader.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`client.set_tracking_enabled(false)`) and a reset (`client.reset_device_id()`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * C++17, CMake 3.16 or newer, libcurl
+* Shipping a build anyone can download? Read [Public builds](#public-builds).
 
 ## Verification status
 
-Version 0.2.0 was built and its unit tests run on macOS 27.0.1 with Apple
+Version 0.3.0 was built and its unit tests run on macOS 27.0.1 with Apple
 clang 21.0.0, CMake 4.3.4 and libcurl 8.7.1, using the commands in
-[Running the tests](#running-the-tests): 89 tests, all passing, with no
+[Running the tests](#running-the-tests): 106 tests, all passing, with no
 network involved. The CI workflow builds and runs the same suite on Linux
 with gcc and clang on pushes to main and on pull requests; it has not run
-on 0.2.0 yet. Windows (including the `BCryptGenRandom` and `%APPDATA%`
+on 0.3.0 yet. Windows (including the `BCryptGenRandom` and `%APPDATA%`
 paths), Android, iOS and consoles have not been built or run, and the SDK
 has **not** yet shipped inside a released game.
 
@@ -33,7 +34,7 @@ issue with anything you hit.
 include(FetchContent)
 FetchContent_Declare(ravensight
     GIT_REPOSITORY https://github.com/Reality-Software-Entertainment/ravensight-cpp.git
-    GIT_TAG v0.2.0)
+    GIT_TAG v0.3.0)
 FetchContent_MakeAvailable(ravensight)
 
 target_link_libraries(your_game PRIVATE ravensight::ravensight)
@@ -96,7 +97,7 @@ Everything game code needs is on `ravensight::Client`:
 
 | Call | What it does |
 | --- | --- |
-| `client.track(name, data)` | Queues an event. `data` is optional. Returns false when the client is not sending. Non blocking. |
+| `client.track(name, data)` | Queues an event. `data` is optional. Returns false when the client is not sending, or when the event's data is over 8,192 bytes as JSON (dropped). Non blocking. |
 | `client.flush()` | Asks the worker to flush now. Non blocking. |
 | `client.flush_and_wait(timeout)` | Flushes and waits for the queue to drain. Blocking. |
 | `client.submit_feedback(message, category, rating, callback)` | Posts player feedback. The callback gets a `FeedbackResult`. |
@@ -104,11 +105,12 @@ Everything game code needs is on `ravensight::Client`:
 | `client.set_tracking_enabled(bool)` | The player's analytics choice, saved and remembered across launches. |
 | `client.reset_device_id()` | A fresh random identity from now on. Returns the new id. |
 | `client.set_enabled(bool)` | Runtime on and off for your own logic. Not saved. |
+| `client.is_collecting()` | True only while the client is collecting: a key, enabled, the player's choice allows it, the kill switch on and the key accepted. |
 | `client.status()` | Why the client is or is not sending (see [Status and reasons](#status-and-reasons)). |
 | `client.session_token()` | The current session token, empty until a session opens. |
 | `client.device_id()` | The id in use. |
 | `client.is_ready()` | True once a session exists. |
-| `client.tracking_enabled()` | False once sending stopped for the run (kill switch or a closed playtest). |
+| `client.tracking_enabled()` | False once sending stopped for the run (kill switch, a refused key or a closed playtest). |
 | `client.is_playtest()` | True during a Ravensight Playtest run. |
 | `client.stats()` | Queued, sent, dropped, batch and session counters, and the last error code. |
 | `client.shutdown()` | `game_exited`, a final flush and worker join. The destructor calls it too. |
@@ -162,7 +164,10 @@ client.track("run_over", {{"level", "castle"}, {"rs_kind", "death"}});
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `ingest_key` | none | Your publishable `gt_live_...` key. Required. |
+| `ingest_key` | empty | Your publishable `gt_live_...` key, or a public `gt_pub_...` key. Empty makes the client inert (see [Public builds](#public-builds)). |
+| `optional` | off | Silences the one warning an inert client logs. |
+| `consent` | `Consent::opt_out` | `Consent::opt_in` sends nothing, and makes no device id, until `set_tracking_enabled(true)`. |
+| `distribution` | empty | A short label for this build, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
 | `api_url` | `https://api.ravensight.io` | Only change this if you self host. Trailing slashes and a trailing `/api/v1` are accepted; `/api/v1` is always appended. |
 | `game_version` | `1.0.0` | Reported to the server. |
 | `platform` | detected | windows, macos, linux, android, ios or unknown, from compile time detection. |
@@ -208,13 +213,76 @@ turns it into the reason code shared by every Ravensight SDK. Set
 | Status | Code | Meaning |
 | --- | --- | --- |
 | `ok` | empty | Sending, or about to. |
-| `disabled` | `disabled` | `enabled` is false, `set_enabled(false)`, or the player opted out. Nothing touches the network. |
-| `invalid_key` | `invalid_key` | The key was refused (`401`, or a `403` other than the codes below). Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` Events still queue (the cap applies); `flush()` makes one more attempt. |
+| `no_key` | `no_key` | Built with an empty `ingest_key`. Inert for the client's lifetime. |
+| `disabled` | `disabled` | `enabled` is false, `set_enabled(false)`, the player opted out, or `Consent::opt_in` and no yes yet. Nothing touches the network. |
+| `invalid_key` | `invalid_key` | The key was refused (`401`, or a `403` other than the codes below) by the settings check, the session, a batch, feedback or suggestions. Logged once as `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` The run ends: the queue is cleared and nothing is retried, not even by `flush()`. A `401` on a batch is an expired session instead: the client opens a new one first. |
 | `tracking_disabled` | `tracking_disabled` | The server kill switch, from `GET /settings` or a `403 tracking_disabled`. The queue is cleared and nothing more is sent this run. |
-| `offline` | `offline` | No connection, a timeout or a server error. Retried from 10 seconds, doubling to 5 minutes. |
+| `offline` | `offline` | No connection, a timeout or a server error. Retried from 10 seconds, doubling to 5 minutes, each wait spread by plus or minus 20 percent. |
 | `rate_limited` | `rate_limited` | `429`, or `503` with `Retry-After`. The SDK waits exactly `Retry-After` seconds. |
 | `session_failed` | `session_failed` | The session could not be opened, or a playtest token was invalid or came without a run id (those two stop the run). |
 | `playtest_job_closed` | `playtest_job_closed` | The playtest job finished. Nothing more is sent this run. |
+
+## Public builds
+
+For a game anyone can download, fork or build from source: a demo, a jam
+entry, an open source project. Nothing here changes a game that sets a key
+and none of these options.
+
+* **No key, no analytics.** A `Client` built with an empty `ingest_key` no
+  longer throws. It is inert: no worker thread, no transport (libcurl is
+  never touched), no file written, no request, and every call is a quiet
+  no-op. `status()` is `Status::no_key`, `is_enabled()` and
+  `is_collecting()` are false, and one warning is logged
+  (`config.optional = true` silences it). So a public repository can ship
+  with no key in it, and a clone or a development build sends nothing.
+* **Inject the key at build time, never commit it.** Use a public `gt_pub_`
+  key for builds anyone can download, passed in by your release build, for
+  example as a compile definition:
+
+  ```cmake
+  # CMakeLists.txt: empty unless the release build passes -DRAVENSIGHT_KEY=...
+  set(RAVENSIGHT_KEY "" CACHE STRING "Ravensight public key, set only by release builds")
+  target_compile_definitions(my_game PRIVATE RAVENSIGHT_KEY="${RAVENSIGHT_KEY}")
+  ```
+
+  ```cpp
+  config.ingest_key = RAVENSIGHT_KEY;  // empty in every build but a release
+  config.optional = true;               // no warning in development builds
+  ```
+
+* **`Consent::opt_in`** sends nothing until the player says yes: no device
+  id is made, and not even the settings check is sent, before
+  `client.set_tracking_enabled(true)`. The yes is saved in the state file
+  (`opt_in=true`), and `set_tracking_enabled(false)` replaces it with the
+  opt-out. `Consent::opt_out`, the default, keeps the 0.2.0 behaviour.
+  Events tracked before the yes are dropped (`track()` returns false), not
+  held for later; events tracked right after it are queued while the
+  settings check runs. `device_id()` is empty before the first yes. Saying
+  no again stops everything but keeps the device id; to forget it too,
+  call `reset_device_id()`.
+* **`distribution`** is a short label of your own, such as
+  `"steam-release"`, `"itch-demo"` or `"source-build"`, sent on the session
+  so you can tell builds apart. It is not sent when empty.
+* **`rs_event_id`** is added to every event's data: the first 16
+  characters of the device id, the start time in hex, a random 8 hex
+  character value made once per client from the operating system's random
+  source, and a counter. It stays with the queued event, so an event sent
+  again after a failure carries the same id and the server can recognise
+  it. The queue is in memory only; it is not saved between launches.
+* **Size cap.** An event whose data is over 8,192 bytes as JSON is dropped
+  before it is queued: `track()` returns false, `stats().dropped` counts
+  it, `stats().last_error` is `event_too_large`, and one warning is logged
+  for the run.
+* **A refused key ends the run.** See `invalid_key` in
+  [Status and reasons](#status-and-reasons). A later
+  `set_tracking_enabled(true)` saves the choice and restarts nothing.
+
+## Compatibility
+
+| ravensight-cpp | C++ | API | Notes |
+| --- | --- | --- | --- |
+| 0.2.0 | C++17, CMake 3.16, libcurl | `/api/v1` | The shared SDK contract. |
+| 0.3.0 | C++17, CMake 3.16, libcurl | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 
 ## About your ingest key
 
@@ -300,7 +368,10 @@ disabled start making no request, the saved opt-out across two clients,
 reset, refused keys, the kill switch, `Retry-After`, the 400 split, the 50
 event batch and 500 event cap, `api_url` forms, feedback validation, the
 playtest path, the session hand-off, acknowledgment by sequence and the
-lifecycle once-guards.
+lifecycle once-guards, plus the public build rules: an inert client with no
+key, opt-in before and after the yes, `distribution` on the session body,
+the backoff jitter bounds, the `rs_event_id` shape, resend and relaunch,
+and the 8,192 byte cap.
 
 ## Device id and storage
 

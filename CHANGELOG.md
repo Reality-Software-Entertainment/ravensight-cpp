@@ -2,6 +2,56 @@
 
 All notable changes to this library are documented here.
 
+## [0.3.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A game that sets a
+key and none of the new options behaves as on 0.2.0, except for the
+changes listed under Breaking.
+
+### Breaking
+
+* `Client` no longer throws `std::invalid_argument` on an empty
+  `ingest_key`. The client is inert instead (see Added).
+* A refused ingest key (`401`, or a `403` that is not the kill switch or a
+  refused playtest token) on the settings check, the session, a batch,
+  feedback or suggestions now ends the run: the queue is cleared, nothing
+  is retried, `track()` returns false and `flush()` sends nothing. Before,
+  events kept queueing and an explicit flush made one more attempt. A
+  `401` on a batch still means an expired session: the client opens a new
+  one first. `tracking_enabled()` is false after a refused key.
+* Backoff waits carry plus or minus 20 percent jitter from the operating
+  system's random source. `Retry-After` is still obeyed exactly. A bare
+  `Queue` has no jitter unless `set_random_source` is called.
+* Every event's data gains an `rs_event_id` member.
+* An event whose data is over 8,192 bytes as JSON is dropped before it is
+  queued: `track()` returns false, `stats().dropped` counts it,
+  `stats().last_error` is `event_too_large` and one warning is logged for
+  the run. Before, it was sent and refused by the server's 400.
+
+### Added
+
+* **Inert without a key.** An empty `ingest_key` makes no worker thread
+  and no transport, writes no file, makes no request; every call is a
+  quiet no-op. `Status::no_key` (code `no_key`), one warning silenced by
+  `Config::optional`. `is_enabled()` is false.
+* `Config::consent`: `Consent::opt_in` makes no device id and sends
+  nothing, not even the settings check, before
+  `set_tracking_enabled(true)`; the yes is saved in the state file as
+  `opt_in=true`. `Consent::opt_out` stays the default. Events tracked
+  before the yes are dropped; events right after it are queued while the
+  settings check runs. Saying no again keeps the device id;
+  `reset_device_id()` forgets it and returns an empty string.
+* `Config::distribution`, sent on `POST /session` when set (trimmed, at
+  most 40 UTF-16 units, no control characters; anything else is not sent
+  and logs one warning).
+* `rs_event_id` on every event: the first 16 characters of the device id,
+  the start time in hex, an 8 hex character per-client nonce from the
+  operating system's random source and a counter. It is part of the queued
+  data, so a resend after a failure carries the same id.
+* `Client::is_collecting()`, true only while the client is collecting.
+* `limits::backoff_jitter`, `limits::max_event_bytes` and
+  `Queue::set_random_source`.
+
 ## [0.2.0] - 2026-10-10
 
 Brings the C++ SDK to the shared Ravensight SDK contract. Pre-1.0, so this
