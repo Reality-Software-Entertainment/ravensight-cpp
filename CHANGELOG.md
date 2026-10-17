@@ -52,6 +52,25 @@ changes listed under Breaking.
 * `limits::backoff_jitter`, `limits::max_event_bytes` and
   `Queue::set_random_source`.
 
+### Typed events and performance sampling (included in this release)
+
+### Added
+
+* Typed event helpers `Client::track_purchase`, `track_resource`,
+  `track_progression` and `track_error`. Each builds the reserved `rs_*`
+  properties over `Client::track`, upper-cases the currency, cuts the error
+  message to 200 characters and the stack to 2000, lets the reserved keys
+  win over the caller's extra properties, and accepts an event name
+  override. Nothing is validated or thrown; the server flags a bad event.
+* Opt-in health sampling: `Config::performance` (default false) and
+  `Client::sample_frame(double dt_seconds)`, called by the game once per
+  frame. It samples once a second into a reservoir of at most 600, and
+  `shutdown()` sends one `health` event with the median and 10th
+  percentile frames per second, memory in megabytes and boot time in
+  milliseconds where the platform exposes them (macOS and Linux). Nothing
+  is sent when no sample was taken.
+* The session request carries `"sdk": "cpp/<version>"`.
+
 ## [0.2.0] - 2026-10-10
 
 Brings the C++ SDK to the shared Ravensight SDK contract. Pre-1.0, so this

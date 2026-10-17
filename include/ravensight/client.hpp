@@ -13,6 +13,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -195,6 +196,12 @@ struct Config {
     std::string playtest_job_id;
     std::string playtest_persona;
 
+    /// Opt in to performance sampling. When true, Client::sample_frame
+    /// samples the frame rate once a second and shutdown() sends one
+    /// `health` event (median and slowest tenth frame rate, memory and boot
+    /// time where the platform exposes them). Off by default.
+    bool performance = false;
+
     /// Optional log sink for SDK activity. Called from the worker thread.
     /// Warnings (a refused key, the kill switch, a closed playtest) go to
     /// stderr when no sink is set.
@@ -296,6 +303,55 @@ public:
     /// a natural pause such as the end of a level, not from a callback.
     bool flush_and_wait(double timeout_seconds = 5.0);
 
+    // --- Typed events ------------------------------------------------------
+    //
+    // Thin helpers over track(): each builds the reserved rs_* properties
+    // and calls track(), so queueing, batching, retries and opt-out are
+    // unchanged and the return value is track()'s. `extra` is merged first,
+    // so a reserved key always wins over a caller key of the same name.
+    // `event_name` overrides the default name when not empty. Nothing is
+    // validated or thrown: a bad value is sent as given and the server
+    // flags the event (it shows on the Implementation health card).
+
+    /// A real money purchase. `amount` is whole minor units (499 is 4.99):
+    /// an integer or a digit string. `currency` is upper-cased. `cart` and
+    /// `transaction_id` are left out when empty. Default name: purchase.
+    bool track_purchase(const Field& amount, const std::string& currency,
+                        const std::string& item_type, const std::string& item_id,
+                        const std::string& cart = "", const std::string& transaction_id = "",
+                        const EventData& extra = {}, const std::string& event_name = "");
+
+    /// In game currency or material moving. `flow` is "source" (gained) or
+    /// "sink" (spent). `item_type` and `item_id` are left out when empty.
+    /// Default name: resource_source or resource_sink.
+    bool track_resource(const std::string& flow, const std::string& resource, double amount,
+                        const std::string& item_type = "", const std::string& item_id = "",
+                        const EventData& extra = {}, const std::string& event_name = "");
+
+    /// A step through the game's structure. `status` is "start", "complete"
+    /// or "fail". `p2` and `p3` are left out when empty. Default name:
+    /// progression_start, progression_complete or progression_fail.
+    bool track_progression(const std::string& status, const std::string& p1,
+                           const std::string& p2 = "", const std::string& p3 = "",
+                           std::optional<double> score = std::nullopt,
+                           const EventData& extra = {}, const std::string& event_name = "");
+
+    /// An error the game hit. `severity` is "debug", "info", "warning",
+    /// "error" or "critical". The message is cut to 200 characters and the
+    /// stack (left out when empty) to 2000. Default name: error.
+    bool track_error(const std::string& severity, const std::string& message,
+                     const std::string& stack = "", const EventData& extra = {},
+                     const std::string& event_name = "");
+
+    // --- Performance sampling (Config::performance) ------------------------
+
+    /// Call once per rendered frame with the frame time in seconds. Takes at
+    /// most one sample per second, keeps at most 600, and does nothing
+    /// unless Config::performance is true. Cheap enough for the game loop
+    /// and thread safe. shutdown() sends one `health` event from the
+    /// samples, and nothing when none were taken.
+    void sample_frame(double dt_seconds);
+
     // --- Feedback and suggestions ------------------------------------------
 
     /// Submits free form player feedback. category is optional (empty) or one
@@ -382,7 +438,8 @@ public:
 
     Stats stats() const;
 
-    /// Queues game_exited (when lifecycle events are on), makes one final
+    /// Queues the one `health` summary (Config::performance, only if a
+    /// sample was taken), game_exited (when lifecycle events are on), makes one final
     /// flush attempt and joins the worker. Blocking for at most about 1.5
     /// seconds past any request already in flight with the built in
     /// transport. Idempotent; the destructor calls it too.

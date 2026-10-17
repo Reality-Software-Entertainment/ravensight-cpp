@@ -19,10 +19,12 @@ option(RAVENSIGHT_BUILD_EXAMPLES "Build the ravensight examples" ${RAVENSIGHT_MA
 add_library(ravensight
     src/client.cpp
     src/curl_transport.cpp
+    src/health.cpp
     src/json.cpp
     src/queue.cpp
     src/storage.cpp
-    src/transport.cpp)
+    src/transport.cpp
+    src/typed_events.cpp)
 add_library(ravensight::ravensight ALIAS ravensight)
 
 target_compile_features(ravensight PUBLIC cxx_std_17)
@@ -66,7 +68,8 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/queue_tests.cpp
         tests/client_tests.cpp
         tests/storage_tests.cpp
-        tests/conformance_tests.cpp)
+        tests/conformance_tests.cpp
+        tests/typed_events_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
     target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
     if(MSVC)

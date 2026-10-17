@@ -1424,8 +1424,8 @@ RS_TEST(distribution_is_sent_on_the_session_body) {
     CHECK(client.flush_and_wait(3.0));
     const json::Value body = session_body(*fake);
     CHECK(body.find("distribution") == nullptr);
-    // A caller who passes only a key gets the 0.2.0 session body.
-    CHECK_EQ(body.members().size(), std::size_t(3));
+    // The SDK version is present even without a distribution label.
+    CHECK_EQ(body.members().size(), std::size_t(4));
 }
 
 RS_TEST(batch_403_ends_the_run) {
