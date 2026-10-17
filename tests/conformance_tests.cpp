@@ -1386,11 +1386,11 @@ RS_TEST(distribution_is_sent_on_the_session_body) {
     {
         auto fake = std::make_shared<Fake>();
         Config config = base_config();
-        config.distribution = "  steam-demo  ";
+        config.distribution = "  native-demo  ";
         Client client(config, proxy(fake));
         CHECK(client.track("x"));
         CHECK(client.flush_and_wait(3.0));
-        CHECK_EQ(session_body(*fake).get_string("distribution", "?"), std::string("steam-demo"));
+        CHECK_EQ(session_body(*fake).get_string("distribution", "?"), std::string("native-demo"));
     }
     {
         auto fake = std::make_shared<Fake>();

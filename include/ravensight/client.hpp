@@ -128,7 +128,7 @@ struct Config {
     /// behaviour.
     Consent consent = Consent::opt_out;
 
-    /// A short label of your own for this build, such as "steam-release"
+    /// A short label of your own for this build, such as "native-release"
     /// or "itch-demo", sent on POST /session as distribution. At most 40
     /// characters (UTF-16 units, as the server counts), no control
     /// characters, surrounding whitespace trimmed; anything else is not sent
