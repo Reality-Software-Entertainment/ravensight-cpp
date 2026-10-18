@@ -49,17 +49,18 @@ RS_TEST(config_consent_typed_values_etag_and_exposure_time) {
  CHECK_EQ(client.get_config_number("speed",7),2.0); CHECK_EQ(client.get_config_number("enabled",7),7.0);
  CHECK(client.get_config_bool("enabled",false)); CHECK_EQ(client.get_config_string("speed","fallback"),std::string("fallback"));
  CHECK(client.get_config_json("layout",{}).is_object());
- client.track("after",{{"rs_exp_fake","spoof"}}); client.flush_and_wait();
+ client.track("after",{{"rs_exp_fake","spoof"},{"exact",9007199254740993LL}}); client.flush_and_wait();
  { std::lock_guard<std::mutex> lock(state->mutex); state->status=304; }
  client.fetch_config(); REQUIRE(wait([&]{return ready.load()==2;}));
  client.shutdown();
- bool before=false,after=false,etag=false,encoded=false;
+ bool before=false,after=false,etag=false,encoded=false,exact=false;
  for (const auto& r:state->requests) {
   if(r.url.find("/ingest/config?")!=std::string::npos){encoded=r.url.find("deviceId=dev%20%2Fone")!=std::string::npos;for(const auto& h:r.headers)if(h.first=="If-None-Match")etag=true;}
+  if(r.body.find("9007199254740993")!=std::string::npos) exact=true;
   auto body=json::Value::parse(r.body);auto events=body.find("events");if(!events)continue;
   for(const auto& e:events->items()){auto data=e.find("data");if(!data)continue;if(e.get_string("event","")=="before" || e.get_string("name","")=="before")before=!data->find("rs_exp_difficulty");if(e.get_string("event","")=="after" || e.get_string("name","")=="after")after=data->get_string("rs_exp_difficulty","")=="easy"&&!data->find("rs_exp_fake");}
  }
- CHECK(encoded); CHECK(etag); CHECK(before); CHECK(after);
+ CHECK(encoded); CHECK(etag); CHECK(before); CHECK(after); CHECK(exact);
 }
 RS_TEST(config_cache_offline_scope_and_optout) {
  auto c=config();auto state=std::make_shared<State>();std::atomic<int> ready{0}; c.on_config_ready=[&](bool){++ready;};

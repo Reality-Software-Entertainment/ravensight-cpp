@@ -496,7 +496,9 @@ public:
         }
         Event event;
         event.name = event_name;
-        event.data_json = write_fields(data);
+        EventData clean;
+        for (const auto& member : data) if (member.first.rfind("rs_exp_", 0) != 0) clean.push_back(member);
+        event.data_json = write_fields(clean);
         event.timestamp = static_cast<long long>(now_unix_seconds());
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -972,17 +974,11 @@ private:
     // Returns false when its data is over limits::max_event_bytes as JSON:
     // it is dropped and never sent.
     bool enqueue_locked(Event event) {
-        // Remove caller-supplied exposure labels, then apply the assignment at
-        // enqueue time. Retried batches retain their original assignments.
-        const auto input = json::Value::parse(event.data_json);
-        json::ObjectWriter tagged;
-        for (const auto& member : input.members()) {
-            if (member.first.rfind("rs_exp_", 0) != 0) tagged.add_raw(member.first, member.second.dump());
-        }
+        // Append without reparsing: preserve exact integer payloads and the
+        // assignment at enqueue time, including across retry attempts.
         for (const auto& experiment : remote_experiments_.items()) {
-            tagged.add("rs_exp_" + experiment.get_string("key", ""), experiment.get_string("variant", ""));
+            append_member(event.data_json, json::escape_string("rs_exp_" + experiment.get_string("key", "")) + ":" + json::escape_string(experiment.get_string("variant", "")));
         }
-        event.data_json = tagged.str();
         if (!playtest_tags_.empty()) {
             append_member(event.data_json, playtest_tags_);
         }
