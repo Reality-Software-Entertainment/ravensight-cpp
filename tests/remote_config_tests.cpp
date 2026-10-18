@@ -30,6 +30,8 @@ bool wait(const std::function<bool()>& p) { for(int i=0;i<500;++i){if(p())return
 RS_TEST(config_validates_bounded_public_document) {
  detail::ConfigSnapshot out;
  CHECK(detail::parse_config(snapshot(),out));
+ auto words = snapshot(); words.replace(words.find("difficulty"), 10, "constructor"); words.replace(words.find("easy"), 4, "prototype");
+ CHECK(detail::parse_config(words,out));
  CHECK(!detail::parse_config(snapshot()+"garbage",out));
  CHECK(!detail::parse_config(snapshot("{\"constructor\":true}"),out));
  CHECK(!detail::parse_config(snapshot("{\"x\":{\"__proto__\":1}}"),out));
