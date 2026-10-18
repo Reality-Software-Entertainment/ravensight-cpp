@@ -23,3 +23,14 @@ consent gating, ETag 304, disk-cache offline fallback and build isolation,
 typed getter fallbacks, exact 64-bit event integer preservation, enqueue-time exposure labels and in-flight identity/opt-out discard.
 The existing session-order fixtures now account for the automatic config request.
 No live service requests, pushes, tags or publication were performed.
+
+## Player Reports follow-up
+
+- Local C++17 library/example/test build passes.
+- Full native test binary: **134 cases, 4,103 assertions, zero failures**.
+- New cases cover copied binary bytes, session-authenticated API requests, credential-free
+  multipart, processing receipts, same-handle retry, reset/opt-out races, failed upload
+  without fallback/finalization, invalid grants and bounded preparation.
+- Evidence: `/tmp/rs-cpp-reports-build.log`, `/tmp/rs-cpp-reports-tests.log`.
+- Tests use scripted transport. Actual S3, packaged games and device integration remain
+  release checks; no publishing, tagging, pushes or deployments were performed.

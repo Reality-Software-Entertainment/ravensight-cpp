@@ -450,3 +450,95 @@ RS_TEST(client_shutdown_flushes_whatever_is_left) {
     }
     CHECK_EQ(delivered, std::size_t(1));
 }
+
+RS_TEST(report_upload_is_binary_credential_free_and_retry_polls_same_submission) {
+    int creates = 0, uploads = 0, finalizes = 0;
+    const std::string id = "0123456789abcdef01234567";
+    auto fake = std::make_shared<FakeTransport>([&](const Request& request) {
+        if (ends_with(request.url,"/reports")) { ++creates; CHECK_EQ(header_value(request,"X-Session-Token"),std::string("st_test")); return json_response(201,"{\"id\":\""+id+"\",\"status\":\"pending\"}"); }
+        if (ends_with(request.url,"/upload")) return json_response(200,"{\"url\":\"https://storage.test/\",\"fields\":{\"key\":\"staging/test\",\"policy\":\"signed\"}}");
+        if (request.url == "https://storage.test/") { ++uploads; CHECK(header_value(request,"X-API-Key").empty()); CHECK(header_value(request,"X-Session-Token").empty()); CHECK(header_value(request,"Authorization").empty()); CHECK(request.body.find(std::string("\x89PNG\0binary",11)) != std::string::npos); return json_response(204,""); }
+        if (ends_with(request.url,"/finalize")) { ++finalizes; return json_response(202,"{\"id\":\""+id+"\",\"status\":\"processing\"}"); }
+        if (ends_with(request.url,"/"+id)) return json_response(200,"{\"id\":\""+id+"\",\"status\":\"complete\",\"reportId\":\"visible\"}");
+        return default_routes(request);
+    });
+    Client client(test_config(),std::make_unique<ProxyTransport>(fake));
+    std::string image("\x89PNG\0binary",11);
+    auto report = client.prepare_report("report-stable","Door blocked","bug",image); REQUIRE(report != nullptr); image.assign("changed");
+    std::promise<ReportResult> first; auto ready = first.get_future(); client.submit_report(report,[&](const ReportResult& r){first.set_value(r);});
+    REQUIRE(ready.wait_for(std::chrono::seconds(3)) == std::future_status::ready); auto result = ready.get(); CHECK(result.ok); CHECK_EQ(result.status,std::string("processing"));
+    std::promise<ReportResult> second; auto done = second.get_future(); client.submit_report(report,[&](const ReportResult& r){second.set_value(r);});
+    REQUIRE(done.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK_EQ(done.get().status,std::string("complete"));
+    CHECK_EQ(creates,1); CHECK_EQ(uploads,1); CHECK_EQ(finalizes,1);
+    client.reset_device_id();
+    bool rejected = false; client.report_status(report,[&](const ReportResult& r){rejected=!r.ok;}); CHECK(rejected);
+}
+RS_TEST(report_preparation_rejects_invalid_or_unbounded_input_without_network) {
+    Config config = test_config(); config.ingest_key = "";
+    Client client(config,std::make_unique<FakeTransport>(&default_routes));
+    CHECK(!client.prepare_report("short","message"));
+    CHECK(!client.prepare_report("valid-id",""));
+    CHECK(!client.prepare_report("valid-id","message","unknown"));
+    CHECK(!client.prepare_report("valid-id","message","bug",std::string(1000001,'x')));
+    CHECK(!client.prepare_report("valid-id","message","bug","GIF89a"));
+    auto report=client.prepare_report("valid-id","message"); REQUIRE(report != nullptr);
+    bool refused=false; client.submit_report(report,[&](const ReportResult& r){refused=!r.ok;}); CHECK(refused);
+}
+RS_TEST(report_rejects_insecure_or_credentialed_upload_grants_without_storage_request) {
+    for (const std::string url : {"http://storage.test", "https://user:secret@storage.test", "x"}) {
+        auto fake=std::make_shared<FakeTransport>([&](const Request& request){
+            if (ends_with(request.url,"/reports")) return json_response(201,"{\"id\":\"0123456789abcdef01234567\",\"status\":\"pending\"}");
+            if (ends_with(request.url,"/upload")) return json_response(200,"{\"url\":"+json::escape_string(url)+",\"fields\":{}}");
+            return default_routes(request);
+        });
+        Client client(test_config(),std::make_unique<ProxyTransport>(fake));
+        auto report=client.prepare_report("valid-id","message","bug",std::string("\x89PNG",4));
+        std::promise<ReportResult> promise; auto ready=promise.get_future(); client.submit_report(report,[&](const ReportResult& r){promise.set_value(r);});
+        REQUIRE(ready.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK_EQ(ready.get().code,std::string("invalid_upload"));
+    }
+}
+RS_TEST(report_optout_during_create_prevents_upload_even_after_reenable) {
+    std::promise<void> entered, release; auto gate=release.get_future(); auto started=entered.get_future();
+    std::atomic<int> uploads{0};
+    auto fake=std::make_shared<FakeTransport>([&](const Request& request){
+        if (ends_with(request.url,"/reports")) { entered.set_value(); gate.wait(); return json_response(201,"{\"id\":\"0123456789abcdef01234567\",\"status\":\"pending\"}"); }
+        if (ends_with(request.url,"/upload")) ++uploads;
+        return default_routes(request);
+    });
+    Client client(test_config(),std::make_unique<ProxyTransport>(fake));
+    auto report=client.prepare_report("stable-report","message","bug",std::string("\x89PNG",4));
+    std::promise<ReportResult> promise; auto ready=promise.get_future(); client.submit_report(report,[&](const ReportResult& r){promise.set_value(r);});
+    const bool began = started.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    if (!began) { release.set_value(); REQUIRE(began); }
+    client.set_tracking_enabled(false); client.set_tracking_enabled(true); release.set_value();
+    REQUIRE(ready.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK_EQ(ready.get().code,std::string("report_session_changed")); CHECK_EQ(uploads.load(),0);
+}
+RS_TEST(report_failed_upload_is_explicit_and_does_not_fallback_or_finalize) {
+    std::atomic<int> creates{0}, uploads{0}, finalizes{0};
+    auto fake=std::make_shared<FakeTransport>([&](const Request& request){
+        if (ends_with(request.url,"/reports")) { ++creates; return json_response(201,"{\"id\":\"0123456789abcdef01234567\",\"status\":\"pending\"}"); }
+        if (ends_with(request.url,"/upload")) return json_response(200,"{\"url\":\"https://storage.test/\",\"fields\":{}}");
+        if (request.url=="https://storage.test/") { ++uploads; return json_response(503,""); }
+        if (ends_with(request.url,"/finalize")) ++finalizes;
+        return default_routes(request);
+    });
+    Client client(test_config(),std::make_unique<ProxyTransport>(fake));
+    auto report=client.prepare_report("stable-report","message","bug",std::string("\x89PNG",4));
+    std::promise<ReportResult> promise; auto ready=promise.get_future(); client.submit_report(report,[&](const ReportResult& r){promise.set_value(r);});
+    REQUIRE(ready.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK_EQ(ready.get().code,std::string("upload_failed")); CHECK_EQ(creates.load(),1); CHECK_EQ(uploads.load(),1); CHECK_EQ(finalizes.load(),0);
+}
+RS_TEST(report_cancel_uses_pinned_session_and_same_submission) {
+    std::atomic<int> deletes{0};
+    auto fake=std::make_shared<FakeTransport>([&](const Request& request){
+        if (ends_with(request.url,"/reports")) return json_response(201,"{\"id\":\"0123456789abcdef01234567\",\"status\":\"pending\"}");
+        if (ends_with(request.url,"/upload")) return json_response(503,"{}");
+        if (request.method=="DELETE") { ++deletes; CHECK_EQ(header_value(request,"X-Session-Token"),std::string("st_test")); return json_response(200,"{\"id\":\"0123456789abcdef01234567\",\"status\":\"canceled\"}"); }
+        return default_routes(request);
+    });
+    Client client(test_config(),std::make_unique<ProxyTransport>(fake));
+    auto report=client.prepare_report("stable-report","message","bug",std::string("\x89PNG",4));
+    std::promise<ReportResult> sent; auto sent_future=sent.get_future(); client.submit_report(report,[&](const ReportResult& r){sent.set_value(r);});
+    REQUIRE(sent_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK(!sent_future.get().ok);
+    std::promise<ReportResult> canceled; auto done=canceled.get_future(); client.cancel_report(report,[&](const ReportResult& r){canceled.set_value(r);});
+    REQUIRE(done.wait_for(std::chrono::seconds(3)) == std::future_status::ready); CHECK_EQ(done.get().status,std::string("canceled")); CHECK_EQ(deletes.load(),1);
+}

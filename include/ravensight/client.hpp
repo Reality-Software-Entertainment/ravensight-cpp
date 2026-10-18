@@ -228,6 +228,16 @@ struct Stats {
 };
 
 /// Result of a feedback submission, delivered to the callback.
+/// Immutable prepared report; retain this handle for explicit retries and polling.
+struct PreparedReport;
+using ReportHandle = std::shared_ptr<PreparedReport>;
+struct ReportResult {
+    bool ok = false;
+    std::string code, id, status, report_id;
+    long http_status = 0;
+};
+using ReportCallback = std::function<void(const ReportResult&)>;
+
 struct FeedbackResult {
     bool ok = false;
     /// Machine readable reason when ok is false. Local refusals, made
@@ -355,6 +365,16 @@ public:
     /// and thread safe. shutdown() sends one `health` event from the
     /// samples, and nothing when none were taken.
     void sample_frame(double dt_seconds);
+
+    /// Copies an encoded PNG/JPEG/WebP (<=1 MB). Empty image sends text only.
+    /// Supply a stable 8–80 character client ID. No network or billing at preparation.
+    /// Invalid input returns null. Callbacks run on the worker, or caller for local refusal.
+    ReportHandle prepare_report(const std::string& client_id, const std::string& message,
+                                const std::string& category = "other", const std::string& image = "");
+    /// Explicit submit/retry, status and cancel. Never silently falls back to text.
+    void submit_report(ReportHandle report, ReportCallback callback);
+    void report_status(ReportHandle report, ReportCallback callback);
+    void cancel_report(ReportHandle report, ReportCallback callback);
 
     // --- Feedback and suggestions ------------------------------------------
 

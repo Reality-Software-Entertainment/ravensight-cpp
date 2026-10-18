@@ -390,6 +390,13 @@ std::string Client::normalize_api_url(const std::string& url) {
 
 // --- Impl -------------------------------------------------------------------
 
+struct PreparedReport {
+    std::shared_ptr<int> owner;
+    unsigned long long generation = 0;
+    std::string payload, image, token, id;
+    bool uploaded = false;
+};
+
 class Client::Impl {
 public:
     Impl(Config config, std::unique_ptr<Transport> transport, std::string api_url)
@@ -562,6 +569,92 @@ public:
             return false;
         }
         return future.get();
+    }
+
+    ReportHandle prepare_report(const std::string& id, const std::string& message,
+                                const std::string& category, const std::string& image) {
+        auto safe = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'; };
+        if (id.size() < 8 || id.size() > 80 || !std::all_of(id.begin(), id.end(), safe) ||
+            detail::trim(message).empty() || message.size() > 500 || !is_feedback_category(category) || image.size() > 1000000) return nullptr;
+        if (!image.empty() && !(image.compare(0, 4, "\x89PNG", 4) == 0 || image.compare(0, 3, "\xff\xd8\xff", 3) == 0 ||
+            (image.size() >= 12 && image.compare(0, 4, "RIFF") == 0 && image.compare(8, 4, "WEBP") == 0))) return nullptr;
+        auto report = std::make_shared<PreparedReport>();
+        { std::lock_guard<std::mutex> lock(mutex_); report->owner = report_owner_; report->generation = identity_generation_; }
+        json::ObjectWriter body;
+        body.add("clientId", id).add("message", detail::trim(message)).add("category", category)
+            .add("capturedAt", static_cast<long long>(now_unix_seconds()));
+        if (!image.empty()) body.add("image", true).add("bytes", static_cast<long long>(image.size())).add("sha256", detail::sha256_hex(image));
+        report->payload = body.str(); report->image = image;
+        return report;
+    }
+
+    void report_command(ReportHandle report, const std::string& operation, ReportCallback callback) {
+        bool accepted = false;
+        { std::lock_guard<std::mutex> lock(mutex_);
+          if (report && report->owner == report_owner_ && report->generation == identity_generation_ && queue_.is_active() && !shutdown_requested_ && !is_playtest_) {
+            commands_.push_back([this, report, operation, callback] { auto result = run_report(report, operation); if (callback) callback(result); });
+            cv_.notify_all(); accepted = true;
+          }
+        }
+        if (!accepted && callback) callback(ReportResult{false, "report_unavailable", "", "", "", 0});
+    }
+
+    ReportResult run_report(const ReportHandle& report, const std::string& operation) {
+        auto valid = [&] { std::lock_guard<std::mutex> lock(mutex_); return report->generation == identity_generation_ && queue_.is_active() && !shutdown_requested_ && !is_playtest_; };
+        auto failed = [](const std::string& code, long status = 0) { return ReportResult{false, code, "", "", "", status}; };
+        if (!valid()) return failed("report_session_changed");
+        if (report->token.empty()) {
+            if (operation != "submit" || !ensure_session(false) || !valid()) return failed("session_required");
+            std::lock_guard<std::mutex> lock(mutex_); report->token = queue_.session_token();
+        }
+        auto send = [&](const char* method, const std::string& path, const std::string& body = "") {
+            if (!valid()) return Response::network_failure("report_session_changed");
+            Request request = make_request(method, path.c_str(), false);
+            request.with_header("X-Session-Token", report->token).with_header("Content-Type", "application/json"); request.body = body;
+            return transport_->send(request);
+        };
+        if (operation != "submit" && report->id.empty()) return failed("report_not_submitted");
+        Response response = report->id.empty() ? send("POST", "/reports", report->payload)
+            : send(operation == "cancel" ? "DELETE" : "GET", "/reports/" + report->id);
+        auto receipt = [&] {
+            if (!valid()) return failed("report_session_changed");
+            if (response.status < 200 || response.status >= 300) return failed(response.error_code("report_failed"), response.status);
+            const auto body = response.parse_json();
+            const auto id = body.get_string("id", ""), status = body.get_string("status", "");
+            if (id.size() != 24 || id.find_first_not_of("0123456789abcdef") != std::string::npos ||
+                (status != "pending" && status != "processing" && status != "complete" && status != "canceled")) return failed("invalid_response");
+            if (!report->id.empty() && report->id != id) return failed("invalid_response");
+            report->id = id;
+            return ReportResult{true, "", id, status, body.get_string("reportId", ""), response.status};
+        };
+        auto result = receipt();
+        if (!result.ok || operation != "submit" || report->image.empty() || result.status != "pending") return result;
+        if (!report->uploaded) {
+            response = send("POST", "/reports/" + report->id + "/upload", "{}");
+            if (!valid()) return failed("report_session_changed");
+            if (response.status != 200) return failed("upload_authorization_failed", response.status);
+            const auto grant = response.parse_json(); const auto url = grant.get_string("url", ""); const auto* fields = grant.find("fields");
+            if (url.size() < 9) return failed("invalid_upload");
+            const auto authority_end = url.find('/', 8); const auto authority = url.substr(8, authority_end == std::string::npos ? std::string::npos : authority_end - 8);
+            if (url.compare(0, 8, "https://") != 0 || authority.empty() || authority.find('@') != std::string::npos ||
+                url.find_first_of("\r\n\t \\") != std::string::npos || !fields || !fields->is_object() || fields->size() > 32) return failed("invalid_upload");
+            const std::string boundary = "rs-" + detail::sha256_hex(report->payload + report->image);
+            std::string multipart;
+            for (const auto& field : fields->members()) {
+                if (field.first.empty() || field.first.size() > 100 || field.first.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos || !field.second.is_string() || field.second.as_string().size() > 16000) return failed("invalid_upload");
+                multipart += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + field.first + "\"\r\n\r\n" + field.second.as_string() + "\r\n";
+            }
+            multipart += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"screenshot\"\r\nContent-Type: application/octet-stream\r\n\r\n" + report->image + "\r\n--" + boundary + "--\r\n";
+            Request upload; upload.method = "POST"; upload.url = url; upload.body = std::move(multipart); upload.abort_at_unix_seconds = &abort_at_;
+            upload.with_header("Content-Type", "multipart/form-data; boundary=" + boundary);
+            if (!valid()) return failed("report_session_changed");
+            response = transport_->send(upload);
+            if (!valid()) return failed("report_session_changed");
+            if (response.status < 200 || response.status >= 300) return failed("upload_failed", response.status);
+            report->uploaded = true;
+        }
+        response = send("POST", "/reports/" + report->id + "/finalize", "{}");
+        return receipt();
     }
 
     void submit_feedback(std::string message, std::string category, int rating,
@@ -1620,6 +1713,7 @@ private:
     unsigned long long identity_generation_ = 0;
     bool nudge_ = false;
     bool wake_ = false;
+    const std::shared_ptr<int> report_owner_ = std::make_shared<int>(0);
     bool shutdown_requested_ = false;
 
     std::thread worker_;
@@ -1652,6 +1746,11 @@ void Client::flush() { impl_->flush(); }
 bool Client::flush_and_wait(double timeout_seconds) {
     return impl_->flush_and_wait(timeout_seconds);
 }
+
+ReportHandle Client::prepare_report(const std::string& id, const std::string& message, const std::string& category, const std::string& image) { return impl_->prepare_report(id, message, category, image); }
+void Client::submit_report(ReportHandle report, ReportCallback callback) { impl_->report_command(std::move(report), "submit", std::move(callback)); }
+void Client::report_status(ReportHandle report, ReportCallback callback) { impl_->report_command(std::move(report), "status", std::move(callback)); }
+void Client::cancel_report(ReportHandle report, ReportCallback callback) { impl_->report_command(std::move(report), "cancel", std::move(callback)); }
 
 void Client::submit_feedback(std::string message, std::string category, int rating,
                              FeedbackCallback callback) {

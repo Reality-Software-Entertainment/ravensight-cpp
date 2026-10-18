@@ -613,3 +613,40 @@ the run with `session_failed` and logs once.
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+### Player Reports with screenshots (held release)
+
+Player Reports are separate from lightweight feedback and synthetic playtest artifacts.
+Prepare a report only after showing the player the screenshot and obtaining permission.
+Pass already encoded PNG, JPEG or WebP bytes (at most 1,000,000 bytes); the SDK does not
+capture the desktop. The server sanitizes accepted images and produces thumbnails.
+
+```cpp
+// encoded_image is a binary std::string; preserve embedded NUL bytes.
+auto report = client.prepare_report("game-generated-stable-id", "Door blocks the player",
+                                    "bug", encoded_image);
+if (report) {
+    client.submit_report(report, [](const ravensight::ReportResult& result) {
+        // result.ok && result.status == "processing": accepted, not delivered yet.
+        // result.status == "complete": result.report_id identifies the inbox report.
+        // Marshal worker callbacks to your game thread before changing UI.
+    });
+}
+// Explicit actions, retaining the SAME report handle:
+client.report_status(report, on_result);
+client.submit_report(report, on_result); // explicit retry, stable content and submission
+client.cancel_report(report, on_result);
+```
+
+Preparation copies the image, payload and capture time and makes no network request.
+The first submission pins the session; identity changes, opt-out and synthetic sessions
+prevent sending. Failed uploads never silently send text instead. There are no automatic
+report retries or polling. A retry reuses the existing receipt and successful upload;
+an expired session is not silently replaced. Keep the handle until completion/cancellation,
+then release it. Handles are in-memory and tied to the original Client instance.
+
+An image report reserves 20,001 weighted events (20,000 image + 1 report); text-only
+reports use 1 event. Charges, processing, cancellation and refunds are server-authoritative.
+An upload/finalization error is not proof that a report was uncharged: explicitly poll or
+cancel the same handle. Enable the Player Reports backend and worker before integration.
+The storage upload uses HTTPS multipart with no ingest, session or playtest credentials.
