@@ -6,7 +6,7 @@ Sessions, batched events, an offline queue, rate limit handling and a server
 side kill switch, in one small C++17 library. The only dependency is libcurl
 for transport; JSON is handled by the SDK's own tiny writer and reader.
 
-## Remote configuration and experiments (0.3.1, held release)
+## Remote configuration and experiments (0.3.1)
 
 Every successful session start fetches public game configuration through the existing ingest key. You can also call `client.fetch_config()` to refresh. The fetch uses the current device, platform and game version; game and environment come from the key.
 
@@ -614,7 +614,7 @@ the run with `session_failed` and logs once.
 
 MIT. Copyright 2026 Reality Software Entertainment.
 
-### Player Reports with screenshots (held release)
+### Player Reports with screenshots (0.3.1)
 
 Player Reports are separate from lightweight feedback and synthetic playtest artifacts.
 Prepare a report only after showing the player the screenshot and obtaining permission.
