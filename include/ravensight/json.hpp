@@ -61,6 +61,7 @@ public:
     /// throwing, because every caller is handling a network response that it
     /// must not crash on. Trailing garbage after a complete value is ignored.
     static Value parse(const std::string& text);
+    static Value parse_strict(const std::string& text);
 
     Type type() const { return type_; }
     bool is_null() const { return type_ == Type::Null; }

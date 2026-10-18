@@ -185,10 +185,10 @@ RS_TEST(client_happy_path_sends_session_then_batch) {
     CHECK(client.track("player_died"));
     CHECK(client.flush_and_wait(3.0));
 
-    REQUIRE(fake->wait_for_requests(3));
+    REQUIRE(fake->wait_for_requests(4));
     const std::vector<Request> requests = fake->requests();
 
-    // Boot order: settings with the ingest key, then session, then the batch.
+    // Boot order: settings with the ingest key, then session, config and the batch.
     CHECK(ends_with(requests[0].url, "/api/v1/settings"));
     CHECK_EQ(header_value(requests[0], "X-API-Key"), std::string("gt_live_test_key"));
 
@@ -199,9 +199,10 @@ RS_TEST(client_happy_path_sends_session_then_batch) {
     CHECK_EQ(session_body.get_string("gameVersion", ""), std::string("9.9.9"));
     CHECK_EQ(session_body.get_string("platform", ""), std::string("test"));
 
-    CHECK(ends_with(requests[2].url, "/api/v1/track/batch"));
-    CHECK_EQ(header_value(requests[2], "X-Session-Token"), std::string("st_test"));
-    const json::Value batch = json::Value::parse(requests[2].body);
+    CHECK(requests[2].url.find("/api/v1/ingest/config?") != std::string::npos);
+    CHECK(ends_with(requests[3].url, "/api/v1/track/batch"));
+    CHECK_EQ(header_value(requests[3], "X-Session-Token"), std::string("st_test"));
+    const json::Value batch = json::Value::parse(requests[3].body);
     const json::Value* events = batch.find("events");
     REQUIRE(events != nullptr);
     CHECK_EQ(events->size(), std::size_t(2));

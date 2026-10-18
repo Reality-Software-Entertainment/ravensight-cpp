@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "health.hpp"
+#include "remote_config.hpp"
 #include "ravensight/curl_transport.hpp"
 #include "ravensight/version.hpp"
 #include "storage.hpp"
@@ -609,6 +610,76 @@ public:
         callback(false, empty_array());
     }
 
+    void fetch_config() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!queue_.is_active() || shutdown_requested_ || config_pending_) return;
+        config_pending_ = true;
+        const auto generation = identity_generation_;
+        commands_.push_back([this, generation] { run_config(generation); });
+        cv_.notify_all();
+    }
+
+    json::Value config_value(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!queue_.is_active()) return {};
+        const auto* value = remote_values_.find(key);
+        return value ? *value : json::Value{};
+    }
+
+    void clear_config_locked() {
+        remote_values_ = {}; remote_experiments_ = {}; remote_etag_.clear();
+        config_pending_ = false; ++identity_generation_;
+    }
+
+    std::string config_cache_path_locked() const {
+        if (is_playtest_ || paths_.state_file.empty()) return {};
+        json::ObjectWriter scope;
+        scope.add("endpoint", api_url_).add("key", config_.ingest_key).add("device", device_id_)
+             .add("platform", platform_).add("build", config_.game_version);
+        return detail::join_path(detail::parent_dir(paths_.state_file), "config_" + detail::sha256_hex(scope.str()) + ".json");
+    }
+
+    void run_config(unsigned long long generation) {
+        std::string cache_path, etag, device;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (generation != identity_generation_ || !queue_.is_active() || shutdown_requested_) return;
+            cache_path = config_cache_path_locked();
+            device = device_id_;
+            if (remote_etag_.empty() && !cache_path.empty()) {
+                detail::ConfigSnapshot cached;
+                if (detail::read_config_cache(cache_path, cached)) {
+                    remote_values_ = cached.values; remote_experiments_ = cached.experiments; remote_etag_ = cached.etag;
+                }
+            }
+            etag = remote_etag_;
+        }
+        const std::string path = "/ingest/config?deviceId=" + detail::url_component(device) +
+            "&platform=" + detail::url_component(platform_) + "&gameVersion=" + detail::url_component(config_.game_version);
+        auto request = make_request("GET", path.c_str(), true);
+        if (!etag.empty()) request.with_header("If-None-Match", etag);
+        const auto response = transport_->send(request);
+        detail::ConfigSnapshot parsed;
+        const bool fresh = response.status == 200 && detail::parse_config(response.body, parsed);
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (generation != identity_generation_ || !queue_.is_active() || shutdown_requested_) return;
+            config_pending_ = false;
+            if (fresh) {
+                remote_values_ = parsed.values; remote_experiments_ = parsed.experiments; remote_etag_ = parsed.etag;
+                if (!cache_path.empty()) detail::write_text_file(cache_path, response.body);
+            }
+            ok = fresh || (response.status == 304 && !etag.empty());
+        }
+        if (response.status == 401 || response.status == 403) {
+            handle_refusal(response);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!queue_.is_active()) return;
+        }
+        if (config_.on_config_ready) config_.on_config_ready(ok);
+    }
+
     void set_enabled(bool enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
         const bool was_active = queue_.is_active();
@@ -682,7 +753,7 @@ public:
             device_id_saved_ = false;
             queue_.clear();
             queue_.invalidate_session();
-            ++identity_generation_;
+            clear_config_locked();
             schedule_settings_check_locked();
             return device_id_;
         }
@@ -702,7 +773,7 @@ public:
         queue_.clear();
         queue_.invalidate_session();
         // A session request already in flight belongs to the old id.
-        ++identity_generation_;
+        clear_config_locked();
         schedule_settings_check_locked();
         return device_id_;
     }
@@ -825,6 +896,7 @@ private:
     // --- Local state --------------------------------------------------------
 
     void apply_local_state_locked() {
+        if (!enabled_ || opted_out_) clear_config_locked();
         queue_.set_locally_enabled(!inert_ && enabled_ && !opted_out_);
     }
 
@@ -837,6 +909,11 @@ private:
             device_id_saved_ = false;
         }
         persist_device_id_locked();
+        detail::ConfigSnapshot cached;
+        const auto path = config_cache_path_locked();
+        if (!path.empty() && detail::read_config_cache(path, cached)) {
+            remote_values_ = cached.values; remote_experiments_ = cached.experiments; remote_etag_ = cached.etag;
+        }
         if (config_.track_lifecycle_events && !started_queued_ && queue_.is_active()) {
             started_queued_ = true;
             Event event;
@@ -895,6 +972,17 @@ private:
     // Returns false when its data is over limits::max_event_bytes as JSON:
     // it is dropped and never sent.
     bool enqueue_locked(Event event) {
+        // Remove caller-supplied exposure labels, then apply the assignment at
+        // enqueue time. Retried batches retain their original assignments.
+        const auto input = json::Value::parse(event.data_json);
+        json::ObjectWriter tagged;
+        for (const auto& member : input.members()) {
+            if (member.first.rfind("rs_exp_", 0) != 0) tagged.add_raw(member.first, member.second.dump());
+        }
+        for (const auto& experiment : remote_experiments_.items()) {
+            tagged.add("rs_exp_" + experiment.get_string("key", ""), experiment.get_string("variant", ""));
+        }
+        event.data_json = tagged.str();
         if (!playtest_tags_.empty()) {
             append_member(event.data_json, playtest_tags_);
         }
@@ -929,6 +1017,7 @@ private:
         if (stopped_) {
             return;
         }
+        clear_config_locked();
         stopped_ = true;
         stop_reason_ = reason;
         last_error_ = error_code.empty() ? to_string(reason) : error_code;
@@ -1106,7 +1195,7 @@ private:
             if (response.status == 201) {
                 const json::Value parsed = response.parse_json();
                 const std::string token = parsed.get_string("token", "");
-                std::lock_guard<std::mutex> lock(mutex_);
+                std::unique_lock<std::mutex> lock(mutex_);
                 if (token.empty()) {
                     note_locked("malformed session response", false);
                     queue_.schedule_backoff(now_unix_seconds());
@@ -1137,6 +1226,11 @@ private:
                 }
                 transient_ = Status::ok;
                 note_locked("session ready", false);
+                if (!config_pending_ && !shutdown_requested_) {
+                    config_pending_ = true;
+                    lock.unlock();
+                    run_config(generation);
+                }
                 return true;
             }
 
@@ -1498,6 +1592,9 @@ private:
     std::atomic<double> abort_at_{0.0};
 
     // Guarded by mutex_.
+    json::Value remote_values_, remote_experiments_;
+    std::string remote_etag_;
+    bool config_pending_ = false;
     std::string device_id_;
     std::string join_token_;
     std::string last_error_;
@@ -1567,6 +1664,16 @@ void Client::submit_feedback(std::string message, std::string category, int rati
 
 void Client::fetch_suggestions(SuggestionsCallback callback) {
     impl_->fetch_suggestions(std::move(callback));
+}
+
+void Client::fetch_config() { impl_->fetch_config(); }
+bool Client::get_config_bool(const std::string& key, bool fallback) const { return impl_->config_value(key).as_bool(fallback); }
+double Client::get_config_number(const std::string& key, double fallback) const { return impl_->config_value(key).as_number(fallback); }
+std::string Client::get_config_string(const std::string& key, const std::string& fallback) const {
+    auto value = impl_->config_value(key); return value.is_string() ? value.as_string() : fallback;
+}
+json::Value Client::get_config_json(const std::string& key, const json::Value& fallback) const {
+    auto value = impl_->config_value(key); return value.is_object() || value.is_array() ? value : fallback;
 }
 
 void Client::set_enabled(bool enabled) { impl_->set_enabled(enabled); }

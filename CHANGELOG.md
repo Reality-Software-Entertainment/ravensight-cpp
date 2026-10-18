@@ -2,6 +2,13 @@
 
 All notable changes to this library are documented here.
 
+## [0.3.1] - Unreleased (held)
+
+- Add consent-gated remote configuration, scoped persistent cache, ETag refresh and strict typed getters.
+- Fetch at session start, notify `on_config_ready`, and retain cached values offline.
+- Attach experiment exposure labels when events enter the queue; discard stale identity responses and validate bounded public documents.
+- Add four config regression cases and update session request-order checks.
+
 ## [0.3.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A game that sets a

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ravensight
-    VERSION 0.3.0
+    VERSION 0.3.1
     DESCRIPTION "Official C++ SDK for Ravensight player analytics"
     HOMEPAGE_URL "https://ravensight.io"
     LANGUAGES CXX)
@@ -17,6 +17,7 @@ option(RAVENSIGHT_BUILD_EXAMPLES "Build the ravensight examples" ${RAVENSIGHT_MA
 
 # BUILD_SHARED_LIBS decides static vs shared, as usual for CMake.
 add_library(ravensight
+    src/remote_config.cpp
     src/client.cpp
     src/curl_transport.cpp
     src/health.cpp
@@ -66,6 +67,7 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/test_main.cpp
         tests/json_tests.cpp
         tests/queue_tests.cpp
+        tests/remote_config_tests.cpp
         tests/client_tests.cpp
         tests/storage_tests.cpp
         tests/conformance_tests.cpp

@@ -6,6 +6,30 @@ Sessions, batched events, an offline queue, rate limit handling and a server
 side kill switch, in one small C++17 library. The only dependency is libcurl
 for transport; JSON is handled by the SDK's own tiny writer and reader.
 
+## Remote configuration and experiments (0.3.1, held release)
+
+Every successful session start fetches public game configuration through the existing ingest key. You can also call `client.fetch_config()` to refresh. The fetch uses the current device, platform and game version; game and environment come from the key.
+
+```cpp
+std::atomic<bool> config_finished{false};
+ravensight::Config options;
+options.ingest_key = "YOUR_PUBLISHABLE_INGEST_KEY";
+options.on_config_ready = [&](bool fresh) {
+    // Worker thread: signal your game loop, do not call shutdown here.
+    config_finished.store(true);
+};
+ravensight::Client client(options);
+// Safe before readiness, offline, or when a value has the wrong type:
+double speed = client.get_config_number("enemy_speed", 2.0);
+bool enabled = client.get_config_bool("show_hint", true);
+auto label = client.get_config_string("welcome_text", "Welcome");
+auto layout = client.get_config_json("layout", ravensight::json::Value::parse("{}"));
+```
+
+The callback receives `true` for an accepted fresh response or HTTP 304, and `false` for a failed refresh retaining any cached values. Getters never coerce types. The JSON getter accepts objects and arrays; absent/scalar values use the fallback. A scoped disk cache under the SDK storage directory is available offline, and its exact ETag is reused. Changing endpoint, ingest key, device ID, platform or build cannot reuse another scope's values. Playtests use memory only. No config cache is read and no config request is made before consent. Opt-out, disabling and identity reset clear active values and invalidate pending responses.
+
+Active assignments automatically add `rs_exp_<experiment_key>` to newly queued events. Events queued before configuration arrives are not relabeled, and retries preserve their original labels. Caller-supplied exposure fields are removed. Documents are limited to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments; malformed documents retain the last valid snapshot. Configuration is public game data, never a place for credentials or secrets. A fresh fetch costs one ordinary event; a conditional 304 costs none.
+
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
 * Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`client.set_tracking_enabled(false)`) and a reset (`client.reset_device_id()`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label

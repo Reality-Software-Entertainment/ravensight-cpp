@@ -766,7 +766,7 @@ RS_TEST(batch_503_honors_retry_after) {
     });
     Client client(base_config(), proxy(fake));
     CHECK(client.track("one"));
-    REQUIRE(fake->wait_for(4, 4.0));
+    REQUIRE(fake->wait_for(5, 4.0)); // settings, session, config, two batches
     const std::vector<Request> requests = fake->requests();
     const std::vector<double> times = fake->times();
     std::vector<double> batch_times;
@@ -1023,7 +1023,7 @@ RS_TEST(playtest_job_closed_stops_permanently) {
     {
         Client client(config, proxy(fake));
         client.track("x");
-        REQUIRE(fake->wait_for(3));
+        REQUIRE(fake->wait_for(4));
         sleep_seconds(0.2);
         CHECK(client.status() == Status::playtest_job_closed);
         CHECK(!client.track("y"));
@@ -1032,7 +1032,7 @@ RS_TEST(playtest_job_closed_stops_permanently) {
         sleep_seconds(0.1);
     }
     CHECK_EQ(batches.load(), 1);
-    CHECK_EQ(fake->total(), std::size_t(3));
+    CHECK_EQ(fake->total(), std::size_t(4));
 }
 
 RS_TEST(invalid_playtest_token_is_session_failed) {

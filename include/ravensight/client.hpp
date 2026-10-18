@@ -209,6 +209,10 @@ struct Config {
 
     /// Optional. Called on the worker thread whenever status() changes.
     std::function<void(Status)> on_status;
+
+    /// Worker-thread notification after a config fetch: true for fresh/304,
+    /// false for offline fallback. Never called for discarded identities.
+    std::function<void(bool)> on_config_ready;
 };
 
 /// Aggregate counters, safe to read from any thread.
@@ -368,6 +372,14 @@ public:
     /// at once with (false, empty array) and makes no request; otherwise the callback
     /// runs on the worker thread.
     void fetch_suggestions(SuggestionsCallback callback);
+
+    /// Refresh public game configuration asynchronously; requires consent.
+    void fetch_config();
+    bool get_config_bool(const std::string& key, bool fallback) const;
+    double get_config_number(const std::string& key, double fallback) const;
+    std::string get_config_string(const std::string& key, const std::string& fallback) const;
+    /// Returns only object/array values; all other types use fallback.
+    json::Value get_config_json(const std::string& key, const json::Value& fallback) const;
 
     // --- Opt-out and identity ----------------------------------------------
 

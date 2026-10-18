@@ -145,11 +145,12 @@ class Parser {
 public:
     Parser(const std::string& text) : s_(text) {}
 
-    bool parse(Value& out) {
+    bool parse(Value& out, bool strict = false) {
         if (!parse_value(out, 0)) {
             return false;
         }
-        return true;
+        skip_whitespace();
+        return !strict || i_ == s_.size();
     }
 
 private:
@@ -398,6 +399,11 @@ Value Value::parse(const std::string& text) {
         return Value();
     }
     return out;
+}
+
+Value Value::parse_strict(const std::string& text) {
+    Value out; Parser parser(text);
+    return parser.parse(out, true) ? out : Value{};
 }
 
 const Value& Value::null_value() {
