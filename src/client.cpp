@@ -287,9 +287,20 @@ const json::Value& empty_array() {
 // shutdown waits for a delivery in progress. Nothing that holds a client's
 // own mutex ever takes the route mutex.
 
+/// What a log line needs, decided before any scrubbing.
+struct LogPlan {
+    bool capture = false; // an error line and the caps have room
+    bool trail = false;   // the trail switch is on
+    long long ms = 0;     // since the client started, for the trail line
+};
+
 struct LogTarget {
     virtual ~LogTarget() = default;
-    virtual void on_host_log(LogLevel level, const std::string& message) = 0;
+    /// Cheap, under the client's lock: may this line be captured or kept?
+    virtual LogPlan plan_host_log(LogLevel level) = 0;
+    /// Under the client's lock, with everything already scrubbed.
+    virtual void deliver_host_log(const detail::PreparedCapture* capture,
+                                  std::string trail_line) = 0;
 };
 
 std::mutex g_route_mutex;
@@ -353,9 +364,33 @@ void log(LogLevel level, std::string_view message) {
         return;
     }
     try {
+        // 1. The caps and switches first, under the locks, without scrubbing.
+        LogPlan plan;
+        {
+            std::lock_guard<std::mutex> lock(g_route_mutex);
+            if (g_route == nullptr) {
+                return;
+            }
+            plan = g_route->plan_host_log(level);
+        }
+        if (!plan.capture && !plan.trail) {
+            return;
+        }
+        // 2. Scrubbing and the dedupe key outside every lock.
+        const std::string text(message);
+        detail::PreparedCapture capture;
+        // A logged error is a warning by the contract, like a console error:
+        // the game reported it and kept running.
+        const bool has_capture =
+            plan.capture &&
+            detail::prepare_capture("warning", "log", "", text, "",
+                                    static_cast<long long>(now_unix_seconds()), capture);
+        std::string line =
+            plan.trail ? detail::Trail::format_line(plan.ms, to_string(level), text) : std::string();
+        // 3. Count against the per key cap and queue, under the locks again.
         std::lock_guard<std::mutex> lock(g_route_mutex);
         if (g_route != nullptr) {
-            g_route->on_host_log(level, std::string(message));
+            g_route->deliver_host_log(has_capture ? &capture : nullptr, std::move(line));
         }
     } catch (...) {
         // A failure inside the capture path is dropped, never reported.
@@ -579,6 +614,12 @@ public:
             const std::string dir = detail::parent_dir(paths_.state_file);
             crash_path_ = detail::join_path(dir, "crash");
             signal_path_ = detail::join_path(dir, "crash_signal");
+            if (capture_wanted_) {
+                // Read and scrubbed here, before the worker exists, so no
+                // lock is held while scrubbing. Sent (and the files
+                // deleted) only once capture installs.
+                load_crash_records();
+            }
         }
 
         apply_local_state_locked();
@@ -611,20 +652,30 @@ public:
     }
 
     // Any thread, through ravensight::log, with the route mutex held.
-    void on_host_log(LogLevel level, const std::string& message) override {
+    LogPlan plan_host_log(LogLevel level) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        LogPlan plan;
+        if (!capture_installed_) {
+            return plan;
+        }
+        plan.capture = (level == LogLevel::error || level == LogLevel::critical) &&
+                       limiter_.has_room(now_unix_seconds());
+        plan.trail = capture_trail_;
+        plan.ms = ms_since_start();
+        return plan;
+    }
+
+    void deliver_host_log(const detail::PreparedCapture* capture, std::string trail_line) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!capture_installed_) {
             return;
         }
-        if (level == LogLevel::error || level == LogLevel::critical) {
-            // A logged error is a warning by the contract, like a console
-            // error: the game reported it and kept running.
-            capture_locked("warning", "log", "", message, "",
-                           static_cast<long long>(now_unix_seconds()));
+        if (capture != nullptr) {
+            capture_locked(*capture);
         }
         // The line itself is context for the next error.
         if (capture_trail_) {
-            trail_.add(ms_since_start(), to_string(level), message);
+            trail_.push(std::move(trail_line));
         }
     }
 
@@ -639,13 +690,18 @@ public:
         event.data_json = write_fields(clean);
         event.timestamp = static_cast<long long>(now_unix_seconds());
 
+        // The trail line is scrubbed before taking the lock.
+        std::string trail_line;
+        if (trail_live_.load() && event.data_json.find("\"rs_kind\":\"error\"") == std::string::npos) {
+            trail_line = detail::Trail::format_line(ms_since_start(), "event", event.name);
+        }
+
         std::lock_guard<std::mutex> lock(mutex_);
         if (shutdown_requested_ || !queue_.is_active()) {
             return false;
         }
-        if (capture_installed_ && capture_trail_ &&
-            event.data_json.find("\"rs_kind\":\"error\"") == std::string::npos) {
-            trail_.add(ms_since_start(), "event", event.name);
+        if (capture_installed_ && capture_trail_ && !trail_line.empty()) {
+            trail_.push(std::move(trail_line));
         }
         if (!enqueue_locked(std::move(event))) {
             return false;
@@ -1278,6 +1334,7 @@ private:
             held_captures_.clear();
             trail_.clear();
         }
+        trail_live_.store(capture_installed_ && capture_trail_);
     }
 
     void install_capture_locked() {
@@ -1298,7 +1355,7 @@ private:
                 detail::install_signal_handlers(signal_path_);
             }
         }
-        read_crash_records_locked();
+        send_crash_records_locked();
     }
 
     void uninstall_capture_locked() {
@@ -1315,29 +1372,44 @@ private:
         trail_.clear();
     }
 
-    // What the previous run saved as it died: one event each, sent through
-    // the same caps and boot hold as anything else. The file is removed on
-    // reading, so a crash is sent at most once.
-    void read_crash_records_locked() {
+    // What the previous run saved as it died, prepared once at startup.
+    void load_crash_records() {
         std::string text;
         detail::CrashRecord record;
-        if (!crash_path_.empty() && detail::read_text_file(crash_path_, text)) {
-            detail::remove_file(crash_path_);
-            if (detail::parse_crash(text, record)) {
-                capture_locked("critical", "crash", record.type, record.message, "",
-                               record.timestamp);
-            }
+        detail::PreparedCapture capture;
+        if (detail::read_text_file(crash_path_, text) && detail::parse_crash(text, record) &&
+            detail::prepare_capture("critical", "crash", record.type, record.message, "",
+                                    record.timestamp, capture)) {
+            pending_crashes_.push_back(capture);
         }
-        if (!signal_path_.empty() && detail::read_text_file(signal_path_, text)) {
-            detail::remove_file(signal_path_);
-            if (detail::parse_signal_record(text, record)) {
-                capture_locked("critical", "crash", record.type, record.message, "",
-                               record.timestamp);
-            }
+        if (detail::read_text_file(signal_path_, text) && detail::parse_signal_record(text, record) &&
+            detail::prepare_capture("critical", "crash", record.type, record.message, "",
+                                    record.timestamp, capture)) {
+            pending_crashes_.push_back(capture);
+        }
+        crash_files_pending_ = true;
+    }
+
+    // One event each, through the same caps and boot hold as anything else
+    // (so discarded unsent when the answer says capture is off). The files
+    // are removed here, so a crash is sent at most once.
+    void send_crash_records_locked() {
+        if (!crash_files_pending_) {
+            return;
+        }
+        crash_files_pending_ = false;
+        detail::remove_file(crash_path_);
+        detail::remove_file(signal_path_);
+        std::vector<detail::PreparedCapture> crashes;
+        crashes.swap(pending_crashes_);
+        for (const auto& capture : crashes) {
+            capture_locked(capture);
         }
     }
 
     void discard_crash_records_locked() {
+        pending_crashes_.clear();
+        crash_files_pending_ = false;
         if (!crash_path_.empty()) {
             detail::remove_file(crash_path_);
             detail::remove_file(signal_path_);
@@ -1351,27 +1423,22 @@ private:
         held_captures_.clear();
     }
 
-    // One automatic capture: scrubbed on the device, cut, capped, then held
-    // (before the server's answer) or queued behind gameplay events.
-    void capture_locked(const std::string& severity, const std::string& source,
-                        const std::string& type, const std::string& raw_message,
-                        const std::string& raw_stack, long long timestamp) {
+    // One automatic capture, already scrubbed (prepare_capture, outside the
+    // lock): counted against the caps, then held (before the server's
+    // answer) or queued behind gameplay events.
+    void capture_locked(const detail::PreparedCapture& capture) {
         if (!capture_installed_) {
             return;
         }
-        const std::string message =
-            detail::trim(detail::scrub_field(raw_message, detail::error_message_chars));
-        if (message.empty()) {
-            return;
-        }
-        const std::string stack = detail::scrub_field(raw_stack, detail::error_stack_chars);
-        const std::string error_type = detail::cut_chars(type, detail::error_type_chars);
-        const std::string first_frame = stack.substr(0, stack.find('\n'));
-        const std::string key =
-            error_type + "|" + detail::message_template(message) + "|" + first_frame;
-        if (!limiter_.allow(key, now_unix_seconds())) {
+        if (!limiter_.allow(capture.key, now_unix_seconds())) {
             return; // over a device cap: dropped silently
         }
+        const std::string& severity = capture.severity;
+        const std::string& source = capture.source;
+        const std::string& message = capture.message;
+        const std::string& error_type = capture.type;
+        const std::string& stack = capture.stack;
+        const long long timestamp = capture.timestamp;
         EventData data{{"rs_kind", "error"},
                        {"rs_severity", severity},
                        {"rs_source", source},
@@ -1419,6 +1486,7 @@ private:
         if (!capture_trail_) {
             trail_.clear();
         }
+        trail_live_.store(capture_installed_ && capture_trail_);
         std::vector<Event> held;
         held.swap(held_captures_);
         update_capture_locked();
@@ -1920,6 +1988,9 @@ private:
         update_status();
 
         for (;;) {
+            // With the Microsoft runtime std::set_terminate is per thread:
+            // the worker gets the handler too, once, while it is armed.
+            detail::install_terminate_handler_on_this_thread();
             std::function<void()> command;
             bool do_shutdown = false;
             bool force = false;
@@ -2061,6 +2132,11 @@ private:
     bool capture_trail_ = false;
     bool capture_conflict_noted_ = false;
     std::vector<Event> held_captures_;
+    std::vector<detail::PreparedCapture> pending_crashes_;
+    bool crash_files_pending_ = false;
+    // Mirrors capture_installed_ && capture_trail_ for track(), which
+    // formats its trail line before taking the lock.
+    std::atomic<bool> trail_live_{false};
     detail::CaptureLimiter limiter_;
     detail::Trail trail_;
     std::string crash_path_;

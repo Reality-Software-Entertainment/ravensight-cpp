@@ -15,8 +15,13 @@ All notable changes to this library are documented here.
   host line that routes the game's log in: every line feeds the trail and an
   error or critical line is sent as `rs_source: "log"`, `rs_severity:
   "warning"`. `ravensight::parse_log_level` reads level names.
-* `Config::install_signal_handlers` (off by default, POSIX only): fatal
-  signals recorded with async-signal-safe writes and chained.
+* `Config::install_signal_handlers` (off by default, POSIX only): a fatal
+  signal that reaches the default action is recorded with async-signal-safe
+  writes; a handler that was there before decides first, so a signal a
+  runtime handles is never a crash. `SA_ONSTACK` with an alternate stack.
+* The crash file is scrubbed before it is written and is readable by the
+  owner only. With the Microsoft runtime the terminate handler is per
+  thread: installed on the client's thread and the SDK worker.
 * `client.set_error_capture(bool)` and `client.is_error_capture_active()`.
 * The game's `errorCapture` switch from the settings and session answers;
   boot errors held (at most 5) until it is known.

@@ -266,19 +266,32 @@ not capture, and `is_error_capture_active()` says which one does.
 ### How a crash is sent
 
 The terminate handler records the active exception's type and `what()` (or
-`std::terminate called without an active exception`), writes one small file
-synchronously (`crash` in the storage directory), then calls the handler that
-was installed before it, or `std::abort` when there was none. The game dies
+`std::terminate called without an active exception`), scrubs it, writes one
+small file synchronously (`crash` in the storage directory, readable by the
+player's account only), then calls the handler that was installed before it,
+or `std::abort` when there was none. The game dies
 exactly as it would have. The next launch with a key and consent reads the
 file, deletes it, scrubs the text and sends one event. A crash is sent at most
 once. There is no stack: C++17 has no portable stack trace, so pass one
 through `track_error` if your game has its own.
 
-The signal handlers write only with `open`, `write` and `close`, which are
-async-signal-safe, then chain to the previous action (or restore the default
-and raise again). After an uncaught exception, the `SIGABRT` that
-`std::abort` raises does not write a second record. A stack overflow may not
-be recorded, because no alternate signal stack is installed. Playtest runs
+The signal handlers let a handler that was there before run first: a
+scripting runtime or a guard page that handles a signal as part of normal
+running is never reported as a crash. Only a signal that falls through to
+the default action is recorded, with `open`, `write` and `close` (all
+async-signal-safe), before the default runs and the process dies as it would
+have. They are installed with `SA_ONSTACK`, and the installing thread gets an
+alternate signal stack when it has none, so a stack overflow on that thread
+can still be recorded (other threads need their own `sigaltstack`). After an
+uncaught exception, the `SIGABRT` that `std::abort` raises does not write a
+second record.
+
+**Windows.** With the Microsoft runtime `std::set_terminate` applies to one
+thread, not the process. The SDK installs the handler on the thread that
+builds the `Client` (or later turns capture on) and on its own worker
+thread, once each. An uncaught exception on any other thread of yours is
+not recorded unless that thread calls `std::set_terminate` itself. The
+Windows path has not been built or run yet. Playtest runs
 keep nothing on disk, so they do not record crashes; the log sink still works.
 
 ### The gate
