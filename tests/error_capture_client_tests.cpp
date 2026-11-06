@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -146,10 +147,10 @@ const char* const on_with_trail = "{\"enabled\":true,\"trail\":true}";
 const char* const on_no_trail = "{\"enabled\":true,\"trail\":false}";
 const char* const off = "{\"enabled\":false,\"trail\":true}";
 
+/// Returns once the settings answer (and so the game's switch) is in: a
+/// flush runs the settings check first, on the worker.
 void wait_ready(Client& client) {
-    for (int i = 0; i < 300 && !client.is_ready(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    client.flush_and_wait(3.0);
 }
 
 } // namespace
