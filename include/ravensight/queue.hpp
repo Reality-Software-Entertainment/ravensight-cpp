@@ -40,12 +40,14 @@ inline constexpr double session_expiry_skew_seconds = 5.0;
 /// Floor on any scheduled retry wait, so a zero delay never busy loops.
 inline constexpr double min_retry_seconds = 0.5;
 
-/// Backoff waits are spread by plus or minus this fraction, so many games
-/// that failed together do not retry together. Retry-After is never spread.
-inline constexpr double backoff_jitter = 0.2;
+/// Backoff waits are multiplied by a random factor in [backoff_jitter_floor,
+/// 1), so many games that failed together do not retry together. Retry-After
+/// is never spread.
+inline constexpr double backoff_jitter_floor = 0.5;
 
-/// The largest event the API accepts: its data serialized as JSON. Bigger
-/// events are dropped before they are queued.
+/// The largest event the API accepts: its data serialized as JSON, with a
+/// error event's message, stack and trail counted one byte a character (as the
+/// server counts). Bigger events are dropped before they are queued.
 inline constexpr std::size_t max_event_bytes = 8192;
 
 } // namespace limits
@@ -58,8 +60,15 @@ struct Event {
     /// A JSON object literal, "{}" when the event carries no payload.
     std::string data_json = "{}";
 
-    /// Unix seconds, captured when the event happened rather than when it is sent.
+    /// Unix milliseconds, captured when the event happened rather than when
+    /// it is sent.
     long long timestamp = 0;
+
+    /// The /session answer's origin object, as JSON text exactly as
+    /// received, of the session this event was tracked under. Empty when
+    /// that session had none or none was open yet. Sent as the event's
+    /// top-level origin when it is not the current session's.
+    std::string origin_json;
 
     /// Assigned by Queue::enqueue, strictly increasing. Lets an acknowledgment
     /// remove exactly the events it carried, even if the queue was cleared
@@ -67,7 +76,8 @@ struct Event {
     unsigned long long sequence = 0;
 
     /// An automatic error capture. Gameplay events always stay ahead of
-    /// these in the queue, and at the cap a capture is dropped first.
+    /// these in the queue, and at the cap a capture is dropped first. The
+    /// queue file keeps the flag, so the rule survives a restart.
     bool automatic_error = false;
 };
 
@@ -142,6 +152,14 @@ public:
     /// Discards everything queued and counts it as dropped.
     void clear();
 
+    /// Gives every queued event with a sequence above after_sequence and no
+    /// origin yet this origin (the session they were tracked in, which
+    /// opened after they were queued). Returns how many changed.
+    int stamp_origin(unsigned long long after_sequence, const std::string& origin_json);
+
+    /// The sequence of the newest queued event, 0 when empty.
+    unsigned long long last_sequence() const { return events_.empty() ? 0 : events_.back().sequence; }
+
     // --- Enablement --------------------------------------------------------
 
     /// The server side kill switch from GET /settings. Disabling discards the queue.
@@ -171,8 +189,9 @@ public:
     /// removed here: they leave the queue only in on_batch_accepted, so a
     /// failed send never loses them.
     ///
-    /// force ignores the retry window, for a flush on shutdown or an explicit
-    /// flush call. It never ignores the session or the kill switch.
+    /// force ignores the backoff window, for a flush on shutdown or an
+    /// explicit flush call. It never ignores a server's Retry-After wait, the
+    /// session or the kill switch.
     FlushPlan begin_flush(double now_seconds, bool force);
 
     /// Clears the in flight marker. Safe to call even if no flush was started.
@@ -195,13 +214,23 @@ public:
     /// overload.
     void on_batch_accepted(std::size_t batch_size);
 
+    /// HTTP 400 naming one event by its index in the batch: drops that event
+    /// only (if still queued), restores the full batch limit. True when one
+    /// was dropped.
+    bool drop_indexed(const FlushPlan& plan, std::size_t index);
+
+    /// Any other 400 on the batch: drops every event the batch carried that
+    /// is still queued. Returns how many.
+    int drop_batch(const FlushPlan& plan);
+
     /// HTTP 401. Drops the session token and leaves every event queued, so
     /// the same batch is re-sent once a fresh session is issued.
     void on_unauthorized();
 
-    /// HTTP 429. Honors retry_after_seconds when the server sent a usable
-    /// Retry-After header, otherwise falls back to exponential backoff. Pass
-    /// a value <= 0 to mean "no header".
+    /// HTTP 429. Honors retry_after_seconds exactly when the server sent a
+    /// usable Retry-After header (a flush call never cuts it short),
+    /// otherwise falls back to exponential backoff. Pass a value <= 0 to mean
+    /// "no header".
     void on_rate_limited(double now_seconds, double retry_after_seconds);
 
     /// HTTP 400 on a batch of batch_size events. A batch larger than one
@@ -225,9 +254,9 @@ public:
     /// Back to the 10 second first delay, with no pending retry window.
     void reset_backoff();
 
-    /// Opens a retry window of the current backoff, spread by plus or minus
-    /// backoff_jitter when a random source is set (never past the ceiling),
-    /// then doubles the backoff up to the ceiling.
+    /// Opens a retry window of the current backoff, multiplied by a factor in
+    /// [backoff_jitter_floor, 1) when a random source is set, then doubles
+    /// the backoff up to the ceiling.
     void schedule_backoff(double now_seconds);
 
     /// A source of draws in [0, 1) for the backoff jitter. Unset (the
@@ -249,11 +278,24 @@ public:
     /// while splitting an oversize batch after a 400.
     int batch_limit() const { return batch_limit_; }
 
+    /// Seconds a server's Retry-After still holds, 0 when none.
+    double retry_after_remaining(double now_seconds) const;
+
     // --- Stats -------------------------------------------------------------
 
     QueueStats stats() const;
 
+    /// Grows by one on every change to the queued events, so an owner that
+    /// persists them knows when to write.
+    unsigned long long revision() const { return revision_; }
+
+    /// Counts events dropped outside the queue (for example too old to load).
+    void count_dropped(int count) { dropped_count_ += count; }
+
 private:
+    /// Removes the plan's events still queued, found by sequence.
+    int remove_sent(const FlushPlan& plan);
+
     /// Removes oldest events until the queue fits the cap minus headroom.
     /// Returns how many went.
     int trim_to_cap(int headroom);
@@ -270,6 +312,8 @@ private:
     double session_expires_at_seconds_ = 0.0;
 
     double next_attempt_at_seconds_ = 0.0;
+    double retry_after_until_seconds_ = 0.0;
+    unsigned long long revision_ = 0;
     double backoff_seconds_ = limits::default_retry_seconds;
     std::function<double()> random_;
     int batch_limit_ = limits::max_batch_size;

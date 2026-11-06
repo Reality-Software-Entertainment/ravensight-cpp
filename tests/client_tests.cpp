@@ -18,6 +18,7 @@
 
 #include "ravensight/client.hpp"
 #include "temp_dirs.hpp"
+#include "decoded.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -50,7 +51,8 @@ public:
 
     explicit FakeTransport(Responder responder) : responder_(std::move(responder)) {}
 
-    Response send(const Request& request) override {
+    Response send(const Request& raw) override {
+        const Request request = rstest::decoded(raw);
         Response response = responder_(request);
         {
             std::lock_guard<std::mutex> lock(mutex_);

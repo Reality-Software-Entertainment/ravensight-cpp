@@ -16,6 +16,9 @@ namespace detail {
 /// Lower case hex SHA-256 of data.
 std::string sha256_hex(const std::string& data);
 
+/// The 32 raw bytes of SHA-256 of data.
+std::string sha256_bytes(const std::string& data);
+
 /// Fills out with n bytes from the operating system's random source:
 /// BCryptGenRandom on Windows, getentropy where it exists, else
 /// /dev/urandom. Returns false when none of them worked.

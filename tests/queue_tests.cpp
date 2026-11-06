@@ -355,24 +355,26 @@ RS_TEST(bad_request_single_event_is_dropped_and_counted) {
     CHECK_EQ(queue.events().front().name, std::string("event_1"));
 }
 
-// --- Backoff jitter (0.3.0) -------------------------------------------------------
+// --- Backoff jitter (delivery contract 4.2) ---------------------------------------
 
 RS_TEST(backoff_jitter_bounds) {
+    // The wait is the backoff times a factor in [0.5, 1).
     Queue low;
     low.set_random_source([] { return 0.0; });
     low.schedule_backoff(100.0);
-    CHECK_EQ(low.seconds_until_next_attempt(100.0), 8.0);
+    CHECK_EQ(low.seconds_until_next_attempt(100.0), 5.0);
     CHECK_EQ(low.backoff_seconds(), 20.0); // the doubling is not spread
 
     Queue high;
-    high.set_random_source([] { return 1.0; });
+    high.set_random_source([] { return 0.999; });
     high.schedule_backoff(100.0);
-    CHECK_EQ(high.seconds_until_next_attempt(100.0), 12.0);
+    CHECK(high.seconds_until_next_attempt(100.0) < 10.0);
+    CHECK(high.seconds_until_next_attempt(100.0) > 9.9);
 
     Queue mid;
     mid.set_random_source([] { return 0.5; });
     mid.schedule_backoff(100.0);
-    CHECK_EQ(mid.seconds_until_next_attempt(100.0), 10.0); // a fixed draw keeps 0.2.0's wait
+    CHECK_EQ(mid.seconds_until_next_attempt(100.0), 7.5);
 
     // Never past the ceiling.
     Queue capped;
@@ -383,15 +385,50 @@ RS_TEST(backoff_jitter_bounds) {
     CHECK(capped.seconds_until_next_attempt(100.0) <= limits::max_backoff_seconds);
     CHECK_EQ(capped.seconds_until_next_attempt(100.0), limits::max_backoff_seconds);
 
-    // A real source stays inside plus or minus 20 percent.
+    // A real source stays inside [5, 10).
     Queue spread;
     spread.set_random_source([] { return static_cast<double>(std::rand()) / (RAND_MAX + 1.0); });
     for (int i = 0; i < 200; ++i) {
         spread.reset_backoff();
         spread.schedule_backoff(0.0);
         const double wait = spread.seconds_until_next_attempt(0.0);
-        CHECK(wait >= 8.0 && wait <= 12.0);
+        CHECK(wait >= 5.0 && wait < 10.0);
     }
+}
+
+RS_TEST(a_forced_flush_cuts_a_backoff_but_never_a_retry_after) {
+    Queue queue;
+    queue.set_session("t", 1e12);
+    Event event;
+    event.name = "a";
+    queue.enqueue(event);
+    queue.on_transport_failure(100.0);
+    CHECK(!queue.begin_flush(101.0, false).should_send());
+    FlushPlan forced = queue.begin_flush(101.0, true);
+    CHECK(forced.should_send());
+    queue.end_flush();
+    queue.on_rate_limited(101.0, 30.0);
+    CHECK(queue.begin_flush(102.0, true).decision == FlushDecision::backing_off);
+    CHECK(queue.begin_flush(131.0, true).should_send());
+}
+
+RS_TEST(an_indexed_400_drops_only_that_event_and_others_drop_the_batch) {
+    Queue queue;
+    queue.set_session("t", 1e12);
+    for (int i = 0; i < 4; ++i) {
+        Event event;
+        event.name = "e" + std::to_string(i);
+        queue.enqueue(event);
+    }
+    FlushPlan plan = queue.begin_flush(0.0, false);
+    CHECK(queue.drop_indexed(plan, 1));
+    queue.end_flush();
+    CHECK_EQ(queue.count(), 3);
+    CHECK_EQ(queue.events()[1].name, std::string("e2"));
+    plan = queue.begin_flush(0.0, false);
+    CHECK_EQ(queue.drop_batch(plan), 3);
+    CHECK(queue.is_empty());
+    CHECK_EQ(queue.stats().dropped, 4);
 }
 
 RS_TEST(retry_after_is_not_jittered) {

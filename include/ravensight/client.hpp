@@ -114,6 +114,96 @@ enum class Consent {
 /// empty string for Status::ok.
 const char* to_string(Status status);
 
+/// What the device reports about itself, sent once on POST /session. Every
+/// field is optional and empty means unknown. The SDK never probes the
+/// hardware: pass only what your engine already exposes without a permission
+/// prompt and without a hardware identifier. Each value is trimmed, kept to
+/// printable characters and cut to 128 characters.
+struct DeviceInfo {
+    /// The device model name, such as "Pixel 7". Never a serial or unique id.
+    std::string model;
+    /// The OS version only, such as "14" or "10.0.22631", without the OS name.
+    std::string os_version;
+    /// The GPU renderer or adapter name.
+    std::string gpu;
+};
+
+/// The ad formats the server reads.
+inline constexpr std::array<std::string_view, 6> ad_formats{
+    {"banner", "interstitial", "rewarded", "native", "app_open", "other"}};
+
+/// The ad lifecycle steps the server reads.
+inline constexpr std::array<std::string_view, 4> ad_results{
+    {"shown", "clicked", "failed", "rewarded"}};
+
+/// One ad lifecycle step (docs/sdk/ADS_ATTRIBUTION_CONTRACT.md). Build one by
+/// hand or with a mediation adapter below, then pass it to Client::track_ad.
+struct AdEvent {
+    /// The network that served the ad: admob, applovin, ironsource, ...
+    std::string network;
+    /// One of ad_formats.
+    std::string format;
+    /// One of ad_results.
+    std::string result;
+    /// The game's own placement name. Empty is not sent.
+    std::string placement;
+    /// Revenue of this impression in micros of currency, as a digit string
+    /// ("1500" is 0.0015). Empty is not sent. Only on a shown result.
+    std::string revenue_micros;
+    /// ISO 4217, three letters. Required with revenue_micros.
+    std::string currency;
+};
+
+/// "0.0015" to "1500": decimal text in major units to whole micros, rounding
+/// half up, on the digits (no float is ever multiplied). Empty when the text
+/// is not a plain non-negative decimal.
+std::string micros_from_decimal_string(const std::string& text);
+
+/// A mediation callback's revenue double in major units to micros:
+/// formatted to decimal text, then micros_from_decimal_string.
+std::string micros_from_double(double major_units);
+
+/// A mediation SDK's format label (BANNER, MREC, INTER, REWARDED,
+/// rewarded_video, REWARDED_INTER, NATIVE, APP_OPEN, ...) to one of
+/// ad_formats; anything unknown is "other".
+std::string map_ad_format(const std::string& label);
+
+// Mediation callback adapters. Each takes the values the mediation SDK's
+// impression-level revenue callback reports, so this library never links
+// that SDK, and returns a shown AdEvent with revenue. Send it with
+// Client::track_ad. For clicks, rewards and load failures build an AdEvent
+// with that result and no revenue.
+
+/// AdMob paid event (AdValue): value_micros is already micros.
+AdEvent ad_from_admob(long long value_micros, const std::string& currency_code,
+                      const std::string& ad_source_name, const std::string& format,
+                      const std::string& placement);
+/// AppLovin MAX onAdRevenuePaid (MaxAd): revenue in USD major units.
+AdEvent ad_from_applovin_max(double revenue, const std::string& network_name,
+                             const std::string& format_label, const std::string& placement);
+/// ironSource LevelPlay onImpressionDataSuccess (ImpressionData): revenue in
+/// USD major units.
+AdEvent ad_from_ironsource(double revenue, const std::string& ad_network,
+                           const std::string& ad_unit, const std::string& placement);
+/// TopOn onAdRevenue or a show callback's ATAdInfo: publisher revenue in
+/// major units of currency.
+AdEvent ad_from_topon(double publisher_revenue, const std::string& currency,
+                      const std::string& network_name, const std::string& ad_type,
+                      const std::string& placement);
+
+/// Where this install was acquired. Sent once per install.
+struct Attribution {
+    /// utm, store_referrer, organic, or a partner name. Required.
+    std::string source;
+    std::string network;
+    std::string campaign;
+    std::string adset;
+    std::string creative;
+    /// When the player clicked or opened the link, epoch milliseconds. 0 is
+    /// not sent.
+    long long touch_time_ms = 0;
+};
+
 struct Config {
     /// Your publishable ingest key, gt_live_... or, for a build anyone can
     /// download, a public gt_pub_... key injected at build time. Empty makes
@@ -165,6 +255,19 @@ struct Config {
 
     /// Offline queue cap. Oldest events are dropped first past this.
     int max_queue_size = limits::default_queue_cap;
+
+    /// Keep unsent events in a file in the storage directory (queue file
+    /// version 2), so events tracked offline or just before a crash or a
+    /// kill are sent on the next launch, under the session, build and
+    /// platform they were tracked in. On by default. The file is written
+    /// within about a second of a change, atomically, and deleted when the
+    /// queue is empty, the player opts out, or the device id is reset.
+    /// Events older than 89 days are dropped when it is read. False keeps
+    /// the queue in memory only. Never used during a playtest run.
+    bool persist_queue = true;
+
+    /// Optional device fields sent on POST /session. See DeviceInfo.
+    DeviceInfo device;
 
     /// How often the worker attempts a flush. 0 or less flushes only on
     /// demand (explicit flush calls, 50 queued events, and shutdown).
@@ -379,6 +482,26 @@ public:
     /// True while this client holds automatic capture: a key, consent, the
     /// game's switch not known to be off, and no other Client holding it.
     bool is_error_capture_active() const;
+    // --- Ads and attribution -------------------------------------------------
+
+    /// One ad lifecycle step as an `rs_ad` event (the contract's fixed name).
+    /// Refused locally, returning false with no event, when network, format
+    /// or result is not usable, when revenue_micros is not a digit string, or
+    /// when revenue comes without a three letter currency (or on a result
+    /// other than shown).
+    bool track_ad(const AdEvent& ad);
+
+    /// track_ad with result "shown" and revenue.
+    bool track_ad_revenue(const std::string& network, const std::string& format,
+                          const std::string& placement, const std::string& revenue_micros,
+                          const std::string& currency);
+
+    /// Records where this install came from, once per install: the first
+    /// call queues one `rs_attribution` event and saves a flag beside the
+    /// device id, and later calls (in this run or any later one) return
+    /// false and send nothing. The offline queue delivers it like any event.
+    /// Empty fields are not sent. A device id reset forgets the flag.
+    bool set_attribution(const Attribution& attribution);
 
     // --- Performance sampling (Config::performance) ------------------------
 
@@ -417,6 +540,14 @@ public:
     void fetch_suggestions(SuggestionsCallback callback);
 
     /// Refresh public game configuration asynchronously; requires consent.
+    ///
+    /// Experiment exposure: the first typed read below in a run (any key)
+    /// marks every experiment the last fetch assigned as exposed. From then
+    /// on each event queued carries rs_exp_<key> = <variant>, and one
+    /// rs_exposure event is queued at that moment. Events queued before the
+    /// first read carry no tag. An experiment missing from a later fetch is
+    /// no longer tagged. A well-formed rs_exp_ value the game sets itself is
+    /// left as it is.
     void fetch_config();
     bool get_config_bool(const std::string& key, bool fallback) const;
     double get_config_number(const std::string& key, double fallback) const;

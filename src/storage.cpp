@@ -103,6 +103,19 @@ void compress(std::uint32_t state[8], const unsigned char block[64]) {
 } // namespace
 
 std::string sha256_hex(const std::string& data) {
+    static const char hex[] = "0123456789abcdef";
+    const std::string raw = sha256_bytes(data);
+    std::string out;
+    out.reserve(64);
+    for (char ch : raw) {
+        const unsigned char byte = static_cast<unsigned char>(ch);
+        out.push_back(hex[byte >> 4]);
+        out.push_back(hex[byte & 0xF]);
+    }
+    return out;
+}
+
+std::string sha256_bytes(const std::string& data) {
     std::uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
                               0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
     const std::size_t length = data.size();
@@ -125,12 +138,11 @@ std::string sha256_hex(const std::string& data) {
     for (std::size_t block = 0; block < tail_blocks; ++block) {
         compress(state, tail + block * 64);
     }
-    static const char hex[] = "0123456789abcdef";
     std::string out;
-    out.reserve(64);
+    out.reserve(32);
     for (std::uint32_t word : state) {
-        for (int shift = 28; shift >= 0; shift -= 4) {
-            out.push_back(hex[(word >> shift) & 0xF]);
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<char>((word >> shift) & 0xFF));
         }
     }
     return out;

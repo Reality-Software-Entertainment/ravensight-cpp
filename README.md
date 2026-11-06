@@ -28,7 +28,7 @@ auto layout = client.get_config_json("layout", ravensight::json::Value::parse("{
 
 The callback receives `true` for an accepted fresh response or HTTP 304, and `false` for a failed refresh retaining any cached values. Getters never coerce types. The JSON getter accepts objects and arrays; absent/scalar values use the fallback. A scoped disk cache under the SDK storage directory is available offline, and its exact ETag is reused. Changing endpoint, ingest key, device ID, platform or build cannot reuse another scope's values. Playtests use memory only. No config cache is read and no config request is made before consent. Opt-out, disabling and identity reset clear active values and invalidate pending responses.
 
-Active assignments automatically add `rs_exp_<experiment_key>` to newly queued events. Events queued before configuration arrives are not relabeled, and retries preserve their original labels. Caller-supplied exposure fields are removed. Documents are limited to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments; malformed documents retain the last valid snapshot. Configuration is public game data, never a place for credentials or secrets. A fresh fetch costs one ordinary event; a conditional 304 costs none.
+**Exposure.** A fetch alone is not an exposure. The first typed read in a run (`get_config_bool`, `get_config_number`, `get_config_string` or `get_config_json`, any key) marks every experiment the last fetch assigned as exposed: one `rs_exposure` event is queued at that moment, and every event queued after it carries `rs_exp_<experiment_key>` = `<variant>`. Events queued before the first read carry no tag, and an event stored offline keeps the tag it was queued with. An experiment missing from a later fetch (stopped) is no longer tagged from the next event on. A well-formed `rs_exp_` value your game sets itself is kept; a malformed one is removed. A run is one launch of the client; `reset_device_id()` starts a new one. Do not log or display the device id beside config values: anyone holding the build's key and a device id can fetch that device's config. Documents are limited to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments; malformed documents retain the last valid snapshot. Configuration is public game data, never a place for credentials or secrets. A fresh fetch costs one ordinary event; a conditional 304 costs none.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
@@ -392,6 +392,8 @@ The session request also carries `"sdk": "cpp/<version>"`.
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | empty | Playtest overrides. Normally read from the environment (see [Playtest](#playtest)). |
 | `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture-unreleased). |
 | `install_signal_handlers` | off | POSIX only: also record fatal signals for the next launch. |
+| `persist_queue` | on | Keep unsent events in a file in the storage directory, so they are sent on the next launch (see [How delivery works](#how-delivery-works)). |
+| `device` | empty | Optional `model`, `os_version` and `gpu`, sent once on the session (see [Device id and storage](#device-id-and-storage)). |
 | `log` | none | Optional log sink, called from the worker thread. Without one, warnings go to stderr. |
 | `on_status` | none | Optional, called on the worker thread when `status()` changes. |
 
@@ -504,26 +506,99 @@ Rotate it from the dashboard at any time.
 
 ## How delivery works
 
+The client follows the Ravensight delivery contract, so an event survives
+a lost connection, a crash, a kill and a build update.
+
 * **Batching.** `track` only queues. The worker sends on its 5 second
   timer, as soon as 50 events are queued, on `flush()` and at shutdown, up
   to 50 events per request (the server limit), until the queue drains.
-* **Offline queue.** Events accumulate up to `max_queue_size`. Past that the
-  oldest are dropped so the newest are always kept.
-* **Kept on failure.** An event leaves the queue when the server accepts it,
-  or when the server refuses it on its own with `400` (it is dropped,
-  counted in `stats().dropped` and logged once, so it cannot block the rest).
-  The queue lives in memory: whatever is still queued when the process
-  exits, or when the shutdown flush runs out of time, is lost.
-* **Session expiry.** A `401` on a batch opens a new session and re sends
-  the same batch, at most twice in a row, then backs off.
-* **Rate limits.** A `429` (or a `503` with `Retry-After`) waits exactly
-  `Retry-After` seconds. With no such header the SDK backs off
-  exponentially from 10 seconds to a 5 minute ceiling.
-* **Oversize batches.** A `400` or a `413` halves the batch and retries down
-  to a single event, which is then dropped, never retried as is.
+* **Captured errors last.** Automatic error captures queue behind every
+  gameplay event, and at the cap a capture is dropped first.
+* **Persisted queue.** Unsent events are kept in
+  `queue-<16 hex>.json` in the storage directory (64-bit FNV-1a of the
+  ingest key), written atomically through a temporary file within about a
+  second of a change and right after every acknowledgement, and deleted
+  when the queue is empty. The next launch reads it and sends what is
+  left. At most `max_queue_size` (500) events are kept, oldest dropped
+  first, and events older than 89 days are dropped when the file is read.
+  `persist_queue = false` keeps the queue in memory only. Never written
+  during a playtest run, and deleted on an opt-out or a device id reset.
+* **Original session, build and platform.** Each event carries its own
+  timestamp in milliseconds, set when it was tracked. The file stores, per
+  group, the `origin` the session answer gave (an opaque signed stamp of
+  that session, build and platform). An event sent under a later session
+  carries that origin, so the server files it under the run it happened
+  in. The stamp is kept only in the queue file, never logged or sent
+  anywhere else.
+* **Removal.** An event leaves the queue, and the file, only on a `2xx`
+  answer for its request or a `400` that names it by `index`.
+* **Event ids.** Every event carries `rs_event_id`, kept across resends,
+  so a resend after a lost answer is recognised as a duplicate (within the
+  key's duplicate window, 24 hours by default).
+* **Answers.** `400` with an `index` drops that event; `400
+  batch_too_large` and `413` halve the batch, down to one event, which is
+  then dropped; any other `400` drops the request's events. A `401`
+  (including `signature_required`, `signature_invalid` and
+  `signature_expired`) opens a new session once and resends with the same
+  ids; a second `401` in a row waits for the backoff. A `403` stops sending
+  for the run and keeps the events in the file for the next launch. A
+  `415` on a compressed body resends uncompressed. `429`, or `503` with
+  `Retry-After`, waits exactly `Retry-After`. Anything else (no network, a
+  timeout, a `5xx`) keeps the events and backs off.
+* **Backoff.** 10 seconds, doubling to a 5 minute ceiling, each wait
+  multiplied by a random factor in [0.5, 1) so devices that failed together
+  do not retry together. Reset after any success. `flush()` and shutdown
+  cut a backoff short, never a `Retry-After`.
+* **Compression.** A body of 1,024 bytes or more is sent gzip compressed
+  (`Content-Encoding: gzip`) when the library was built with zlib, which
+  CMake finds where libcurl is installed. Without zlib, bodies go plain.
+* **Signed requests.** When the session answer carries `signing` (public
+  `gt_pub_` keys), every batch is signed: `X-Ravensight-Timestamp` and
+  `X-Ravensight-Signature: v1=<HMAC-SHA256>` over the uncompressed body,
+  with the device clock corrected by the server's time. The secret is kept
+  in memory only. Signing proves the request came from code holding that
+  session's secret; it does not prove the build is unmodified.
+* **Size.** An event whose data is over 8 KB as JSON is dropped before it
+  is queued, with one warning. An error event's message (200), stack
+  (2,000) and trail (1,500) count one byte a character, as the server
+  counts them.
 * **Kill switch.** `GET /settings` is read once, when the client first may
-  send. If the server has tracking off for your game, the queue is cleared
-  and nothing is sent.
+  send. If the server has tracking off for your game, nothing is sent.
+
+## Ads and attribution
+
+```cpp
+// An impression with revenue, in micros of the currency: 0.0015 USD.
+client.track_ad_revenue("admob", "rewarded", "level_end", "1500", "USD");
+
+// From a mediation callback, without linking the mediation SDK here.
+client.track_ad(ravensight::ad_from_applovin_max(revenue, network_name, format_label, placement));
+client.track_ad(ravensight::ad_from_admob(value_micros, currency_code, ad_source_name, "rewarded", "shop"));
+client.track_ad(ravensight::ad_from_ironsource(revenue, ad_network, ad_unit, placement));
+client.track_ad(ravensight::ad_from_topon(publisher_revenue, currency, network_name, ad_type, placement));
+
+// Clicks, rewards and failures carry no revenue.
+client.track_ad({"admob", "rewarded", "rewarded", "level_end", "", ""});
+
+// Where the install came from, once per install.
+client.set_attribution({"store_referrer", "", "spring", "", "", 0});
+```
+
+* Revenue is a digit string of micros, never a float. A mediation double is
+  formatted to decimal text and converted on its digits, rounding half up
+  (`ravensight::micros_from_double`, `ravensight::micros_from_decimal_string`).
+* One currency per event, as the mediation SDK reported it. Never converted.
+* Revenue is sent only on `shown`. Revenue without a three letter currency,
+  or on another result, is refused locally and nothing is sent.
+* Mediation format labels map to `banner`, `interstitial`, `rewarded`,
+  `native`, `app_open` or `other` (`ravensight::map_ad_format`).
+* `set_attribution` sends one `rs_attribution` event per install and saves
+  a flag beside the device id; a device id reset forgets it. Pass
+  `client.device_id()` to an attribution partner as its customer user id if
+  you use one.
+
+The server must know the `rs_ad_` and `rs_attr_` keys before a public key
+accepts them: use these helpers only with a server release that has them.
 
 ## Threading contract
 
@@ -613,7 +688,20 @@ memory for the run, so each launch counts as a new player.
 
 No hardware identifier, advertising id, IP based fingerprint or personal
 data is collected by the SDK itself. Only the events you choose to send
-leave the machine.
+leave the machine, plus, when you set them, these optional device fields
+on the session:
+
+| Field | What | Source |
+| --- | --- | --- |
+| `device.model` | device model name, never a serial | you pass it; the SDK does not probe |
+| `device.os_version` | OS version only, without the OS name | you pass it |
+| `device.gpu` | GPU renderer or adapter name | you pass it |
+
+Each is trimmed, kept to printable characters and cut to 128 characters;
+an empty field is not sent. Country is never sent by the SDK.
+
+The storage directory also holds the queue file, `attribution_sent`, and
+the config cache.
 
 ## Opting out and resetting
 

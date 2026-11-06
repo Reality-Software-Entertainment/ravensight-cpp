@@ -37,12 +37,30 @@ int Queue::enqueue(Event event) {
                                                 [](const Event& e) { return e.automatic_error; });
         events_.insert(first_capture, std::move(event));
     }
+    ++revision_;
     return dropped;
 }
 
 void Queue::clear() {
     dropped_count_ += static_cast<int>(events_.size());
+    if (!events_.empty()) {
+        ++revision_;
+    }
     events_.clear();
+}
+
+int Queue::stamp_origin(unsigned long long after_sequence, const std::string& origin_json) {
+    int changed = 0;
+    for (Event& event : events_) {
+        if (event.sequence > after_sequence && event.origin_json.empty()) {
+            event.origin_json = origin_json;
+            ++changed;
+        }
+    }
+    if (changed > 0) {
+        ++revision_;
+    }
+    return changed;
 }
 
 void Queue::set_server_tracking_enabled(bool enabled) {
@@ -90,7 +108,8 @@ FlushPlan Queue::begin_flush(double now_seconds, bool force) {
         plan.decision = FlushDecision::empty;
         return plan;
     }
-    if (!force && seconds_until_next_attempt(now_seconds) > 0.0) {
+    if (retry_after_remaining(now_seconds) > 0.0 ||
+        (!force && seconds_until_next_attempt(now_seconds) > 0.0)) {
         plan.decision = FlushDecision::backing_off;
         return plan;
     }
@@ -115,13 +134,16 @@ void Queue::end_flush() {
 void Queue::on_batch_accepted(std::size_t batch_size) {
     const std::size_t remove = std::min(batch_size, events_.size());
     events_.erase(events_.begin(), events_.begin() + static_cast<std::ptrdiff_t>(remove));
+    if (remove > 0) {
+        ++revision_;
+    }
     sent_count_ += static_cast<int>(remove);
     ++batch_count_;
     batch_limit_ = limits::max_batch_size;
     reset_backoff();
 }
 
-int Queue::on_batch_accepted(const FlushPlan& plan) {
+int Queue::remove_sent(const FlushPlan& plan) {
     int removed = 0;
     for (const Event& sent : plan.batch) {
         const auto found = std::find_if(events_.begin(), events_.end(), [&](const Event& e) {
@@ -131,6 +153,14 @@ int Queue::on_batch_accepted(const FlushPlan& plan) {
             events_.erase(found);
             ++removed;
         }
+    }
+    return removed;
+}
+
+int Queue::on_batch_accepted(const FlushPlan& plan) {
+    const int removed = remove_sent(plan);
+    if (removed > 0) {
+        ++revision_;
     }
     sent_count_ += removed;
     ++batch_count_;
@@ -157,7 +187,35 @@ bool Queue::on_bad_request(const FlushPlan& plan) {
     }
     events_.erase(found);
     ++dropped_count_;
+    ++revision_;
     return true;
+}
+
+bool Queue::drop_indexed(const FlushPlan& plan, std::size_t index) {
+    batch_limit_ = limits::max_batch_size;
+    if (index >= plan.batch.size()) {
+        return false;
+    }
+    const unsigned long long target = plan.batch[index].sequence;
+    for (auto it = events_.begin(); it != events_.end(); ++it) {
+        if (it->sequence == target) {
+            events_.erase(it);
+            ++dropped_count_;
+            ++revision_;
+            return true;
+        }
+    }
+    return false;
+}
+
+int Queue::drop_batch(const FlushPlan& plan) {
+    batch_limit_ = limits::max_batch_size;
+    const int removed = remove_sent(plan);
+    dropped_count_ += removed;
+    if (removed > 0) {
+        ++revision_;
+    }
+    return removed;
 }
 
 void Queue::on_unauthorized() {
@@ -167,6 +225,7 @@ void Queue::on_unauthorized() {
 void Queue::on_rate_limited(double now_seconds, double retry_after_seconds) {
     if (retry_after_seconds > 0.0) {
         next_attempt_at_seconds_ = now_seconds + retry_after_seconds;
+        retry_after_until_seconds_ = next_attempt_at_seconds_;
         return;
     }
     schedule_backoff(now_seconds);
@@ -184,6 +243,7 @@ void Queue::on_bad_request(std::size_t batch_size) {
     if (!events_.empty()) {
         events_.pop_front();
         ++dropped_count_;
+        ++revision_;
     }
     batch_limit_ = limits::max_batch_size;
 }
@@ -195,13 +255,15 @@ void Queue::on_transport_failure(double now_seconds) {
 void Queue::reset_backoff() {
     backoff_seconds_ = limits::default_retry_seconds;
     next_attempt_at_seconds_ = 0.0;
+    retry_after_until_seconds_ = 0.0;
 }
 
 void Queue::schedule_backoff(double now_seconds) {
     double wait = backoff_seconds_;
     if (random_) {
         const double draw = std::min(std::max(random_(), 0.0), 1.0);
-        const double factor = 1.0 - limits::backoff_jitter + 2.0 * limits::backoff_jitter * draw;
+        const double factor =
+            limits::backoff_jitter_floor + (1.0 - limits::backoff_jitter_floor) * draw;
         wait = std::min(backoff_seconds_ * factor, limits::max_backoff_seconds);
     }
     next_attempt_at_seconds_ = now_seconds + wait;
@@ -210,6 +272,10 @@ void Queue::schedule_backoff(double now_seconds) {
 
 double Queue::seconds_until_next_attempt(double now_seconds) const {
     return std::max(0.0, next_attempt_at_seconds_ - now_seconds);
+}
+
+double Queue::retry_after_remaining(double now_seconds) const {
+    return std::max(0.0, retry_after_until_seconds_ - now_seconds);
 }
 
 double Queue::retry_timer_seconds(double now_seconds) const {
@@ -232,6 +298,9 @@ int Queue::trim_to_cap(int headroom) {
     while (static_cast<int>(events_.size()) > target) {
         events_.pop_front();
         ++dropped;
+    }
+    if (dropped > 0) {
+        ++revision_;
     }
     dropped_count_ += dropped;
     return dropped;
