@@ -73,7 +73,8 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/storage_tests.cpp
         tests/conformance_tests.cpp
         tests/typed_events_tests.cpp
-        tests/error_capture_tests.cpp)
+        tests/error_capture_tests.cpp
+        tests/error_capture_client_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
     target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_compile_definitions(ravensight_tests PRIVATE

@@ -43,6 +43,11 @@ std::string cut_chars(const std::string& text, std::size_t max_chars);
 /// word (so file paths in a stack survive). Idempotent.
 std::string scrub(const std::string& text);
 
+/// The contract's bounded scrub for one field: cut to 4 times limit
+/// characters, scrub, then cut to limit. Some rules are quadratic in the
+/// input, so a huge log line never costs more than a bounded scrub.
+std::string scrub_field(const std::string& text, std::size_t limit);
+
 /// The message with its variable parts replaced (UUIDs, URLs, quoted text,
 /// hex runs of 8 or more, numbers), for the local dedupe key.
 std::string message_template(const std::string& message);

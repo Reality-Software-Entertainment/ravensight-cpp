@@ -202,6 +202,20 @@ struct Config {
     /// time where the platform exposes them). Off by default.
     bool performance = false;
 
+    /// Automatic error capture, on by default. Once the client has a key and
+    /// the player's consent it installs a chained std::terminate handler
+    /// (an uncaught exception or a std::terminate call is saved to a small
+    /// file and sent on the next launch) and takes ravensight::log lines.
+    /// Nothing is captured while the game's Errors switch on the server is
+    /// off. Set false to opt the game out; Client::set_error_capture changes
+    /// it during the run. track_error() is never affected.
+    bool error_capture = true;
+
+    /// Opt in, POSIX only: also record SIGSEGV, SIGBUS, SIGFPE, SIGILL and
+    /// SIGABRT, with async-signal-safe writes only, chained to whatever
+    /// handler was there before. Off by default. Needs error_capture.
+    bool install_signal_handlers = false;
+
     /// Optional log sink for SDK activity. Called from the worker thread.
     /// Warnings (a refused key, the kill switch, a closed playtest) go to
     /// stderr when no sink is set.
@@ -356,6 +370,15 @@ public:
     bool track_error(const std::string& severity, const std::string& message,
                      const std::string& stack = "", const EventData& extra = {},
                      const std::string& event_name = "");
+
+    // --- Automatic error capture (Config::error_capture) -------------------
+
+    /// Turns automatic capture on or off for this run. Never saved.
+    void set_error_capture(bool enabled);
+
+    /// True while this client holds automatic capture: a key, consent, the
+    /// game's switch not known to be off, and no other Client holding it.
+    bool is_error_capture_active() const;
 
     // --- Performance sampling (Config::performance) ------------------------
 

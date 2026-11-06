@@ -178,6 +178,10 @@ std::string scrub(const std::string& input) {
     return scrub_long_runs(out);
 }
 
+std::string scrub_field(const std::string& text, std::size_t limit) {
+    return cut_chars(scrub(cut_chars(text, 4 * limit)), limit);
+}
+
 std::string message_template(const std::string& message) {
     static const regex uuid(
         R"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})");
@@ -234,12 +238,12 @@ void Trail::add(long long ms_since_start, const std::string& level, const std::s
     std::string flat = text;
     std::replace(flat.begin(), flat.end(), '\n', ' ');
     std::replace(flat.begin(), flat.end(), '\r', ' ');
-    flat = trim(cut_chars(flat, 1000));
+    flat = trim(scrub_field(flat, trail_line_chars));
     if (flat.empty()) {
         return;
     }
-    const std::string line = "+" + std::to_string(std::max(0LL, ms_since_start)) + " " + level +
-                             " " + scrub(flat);
+    const std::string line =
+        "+" + std::to_string(std::max(0LL, ms_since_start)) + " " + level + " " + flat;
     lines_.push_back(cut_chars(line, trail_line_chars));
     while (lines_.size() > trail_lines) {
         lines_.pop_front();
@@ -434,9 +438,6 @@ void write_now(const char* path, const std::string& text) {
 
 bool install_terminate_handler(const std::string& path) {
     std::lock_guard<std::mutex> lock(g_hook_mutex);
-    if (g_terminate_armed.load() && g_terminate_installed) {
-        return true; // one client holds it already
-    }
     if (!copy_path(g_terminate_path, path)) {
         return false;
     }

@@ -8,6 +8,7 @@
 
 #include "ravensight/client.hpp"
 #include "ravensight/curl_transport.hpp"
+#include "ravensight/error_capture.hpp"
 #include "ravensight/json.hpp"
 #include "ravensight/queue.hpp"
 #include "ravensight/transport.hpp"

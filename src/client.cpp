@@ -19,7 +19,9 @@
 #include <utility>
 #include <vector>
 
+#include "error_capture.hpp"
 #include "health.hpp"
+#include "ravensight/error_capture.hpp"
 #include "remote_config.hpp"
 #include "ravensight/curl_transport.hpp"
 #include "ravensight/version.hpp"
@@ -278,7 +280,91 @@ const json::Value& empty_array() {
     return value;
 }
 
+// --- Log routing and capture ownership --------------------------------------
+//
+// ravensight::log reaches one client: the first one built with a key. The
+// route mutex is held while a line is delivered, so a client detaching in
+// shutdown waits for a delivery in progress. Nothing that holds a client's
+// own mutex ever takes the route mutex.
+
+struct LogTarget {
+    virtual ~LogTarget() = default;
+    virtual void on_host_log(LogLevel level, const std::string& message) = 0;
+};
+
+std::mutex g_route_mutex;
+LogTarget* g_route = nullptr;
+
+// The client holding the process wide hooks (the terminate handler).
+std::atomic<const void*> g_capture_owner{nullptr};
+
+// True on a thread while it hands the SDK's own lines to Config::log, so a
+// host that routes Config::log back into ravensight::log makes no loop.
+thread_local bool t_in_sdk_log = false;
+
+bool is_sdk_line(std::string_view message) {
+    return message.substr(0, 10) == "Ravensight";
+}
+
 } // namespace
+
+const char* to_string(LogLevel level) {
+    switch (level) {
+        case LogLevel::debug:
+            return "debug";
+        case LogLevel::info:
+            return "info";
+        case LogLevel::warning:
+            return "warning";
+        case LogLevel::error:
+            return "error";
+        case LogLevel::critical:
+            return "critical";
+    }
+    return "info";
+}
+
+bool parse_log_level(std::string_view name, LogLevel& out) {
+    std::string lower(name);
+    for (char& c : lower) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    lower = detail::trim(lower);
+    if (lower == "debug" || lower == "trace") {
+        out = LogLevel::debug;
+    } else if (lower == "info") {
+        out = LogLevel::info;
+    } else if (lower == "warn" || lower == "warning") {
+        out = LogLevel::warning;
+    } else if (lower == "error" || lower == "err") {
+        out = LogLevel::error;
+    } else if (lower == "critical" || lower == "fatal") {
+        out = LogLevel::critical;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void log(LogLevel level, std::string_view message) {
+    if (t_in_sdk_log || message.empty() || is_sdk_line(message)) {
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_route_mutex);
+        if (g_route != nullptr) {
+            g_route->on_host_log(level, std::string(message));
+        }
+    } catch (...) {
+        // A failure inside the capture path is dropped, never reported.
+    }
+}
+
+LogSink log_sink() {
+    return [](LogLevel level, std::string_view message) { ravensight::log(level, message); };
+}
 
 const char* to_string(Status status) {
     switch (status) {
@@ -397,7 +483,7 @@ struct PreparedReport {
     bool uploaded = false;
 };
 
-class Client::Impl {
+class Client::Impl : public LogTarget {
 public:
     Impl(Config config, std::unique_ptr<Transport> transport, std::string api_url)
         : config_(std::move(config)),
@@ -488,14 +574,59 @@ public:
             }
         }
 
+        capture_wanted_ = config_.error_capture;
+        if (!is_playtest_ && !paths_.state_file.empty()) {
+            const std::string dir = detail::parent_dir(paths_.state_file);
+            crash_path_ = detail::join_path(dir, "crash");
+            signal_path_ = detail::join_path(dir, "crash_signal");
+        }
+
         apply_local_state_locked();
         if (queue_.is_active()) {
             on_locally_enabled_locked();
         }
+        update_capture_locked();
+        {
+            std::lock_guard<std::mutex> route(g_route_mutex);
+            if (g_route == nullptr) {
+                g_route = this;
+            }
+        }
         worker_ = std::thread([this] { worker_main(); });
     }
 
-    ~Impl() { shutdown(); }
+    ~Impl() override { shutdown(); }
+
+    // --- Automatic error capture ----------------------------------------------
+
+    void set_error_capture(bool enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        capture_wanted_ = enabled;
+        update_capture_locked();
+    }
+
+    bool is_error_capture_active() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return capture_installed_;
+    }
+
+    // Any thread, through ravensight::log, with the route mutex held.
+    void on_host_log(LogLevel level, const std::string& message) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!capture_installed_) {
+            return;
+        }
+        if (level == LogLevel::error || level == LogLevel::critical) {
+            // A logged error is a warning by the contract, like a console
+            // error: the game reported it and kept running.
+            capture_locked("warning", "log", "", message, "",
+                           static_cast<long long>(now_unix_seconds()));
+        }
+        // The line itself is context for the next error.
+        if (capture_trail_) {
+            trail_.add(ms_since_start(), to_string(level), message);
+        }
+    }
 
     bool track(const std::string& event_name, const EventData& data) {
         if (event_name.empty()) {
@@ -511,6 +642,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (shutdown_requested_ || !queue_.is_active()) {
             return false;
+        }
+        if (capture_installed_ && capture_trail_ &&
+            event.data_json.find("\"rs_kind\":\"error\"") == std::string::npos) {
+            trail_.add(ms_since_start(), "event", event.name);
         }
         if (!enqueue_locked(std::move(event))) {
             return false;
@@ -783,6 +918,7 @@ public:
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
+        update_capture_locked();
         schedule_settings_check_locked();
     }
 
@@ -821,6 +957,11 @@ public:
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
+        update_capture_locked();
+        if (!enabled) {
+            // The player said no: a crash saved earlier is never sent.
+            discard_crash_records_locked();
+        }
         schedule_settings_check_locked();
     }
 
@@ -849,6 +990,7 @@ public:
             queue_.clear();
             queue_.invalidate_session();
             clear_config_locked();
+            reset_capture_run_locked();
             schedule_settings_check_locked();
             return device_id_;
         }
@@ -869,6 +1011,7 @@ public:
         queue_.invalidate_session();
         // A session request already in flight belongs to the old id.
         clear_config_locked();
+        reset_capture_run_locked();
         schedule_settings_check_locked();
         return device_id_;
     }
@@ -915,11 +1058,21 @@ public:
 
     void shutdown() {
         {
+            // Outside mutex_: a delivery in progress finishes first.
+            std::lock_guard<std::mutex> route(g_route_mutex);
+            if (g_route == this) {
+                g_route = nullptr;
+            }
+        }
+        {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!shutdown_requested_) {
                 shutdown_requested_ = true;
                 abort_at_.store(now_unix_seconds() + shutdown_hold_seconds);
             }
+            // Nothing reinstalls after this: update_capture_locked checks
+            // shutdown_requested_.
+            update_capture_locked();
             cv_.notify_all();
         }
         if (worker_.joinable()) {
@@ -947,6 +1100,7 @@ private:
             std::lock_guard<std::mutex> lock(mutex_);
             lines.swap(pending_logs_);
         }
+        t_in_sdk_log = true;
         for (const auto& line : lines) {
             const std::string text = "Ravensight: " + line.first;
             if (config_.log) {
@@ -955,6 +1109,7 @@ private:
                 std::fprintf(stderr, "%s\n", text.c_str());
             }
         }
+        t_in_sdk_log = false;
     }
 
     Status compute_status_locked() const {
@@ -1099,6 +1254,181 @@ private:
         return true;
     }
 
+    // --- Automatic error capture, see docs/errors/CONTRACT.md ------------------
+
+    long long ms_since_start() const {
+        return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - run_start_)
+                                          .count());
+    }
+
+    // Installs or removes the hooks so they run exactly while there is a
+    // key, consent, the client may send, the game's own Config switch is on
+    // and the server's switch is not known to be off. Before the server's
+    // answer they run too, holding what they capture.
+    void update_capture_locked() {
+        const bool wanted = !inert_ && !shutdown_requested_ && capture_wanted_ && queue_.is_active() &&
+                            (!capture_known_ || capture_server_enabled_);
+        if (wanted && !capture_installed_) {
+            install_capture_locked();
+        } else if (!wanted && capture_installed_) {
+            uninstall_capture_locked();
+        }
+        if (!capture_installed_) {
+            held_captures_.clear();
+            trail_.clear();
+        }
+    }
+
+    void install_capture_locked() {
+        const void* expected = nullptr;
+        if (!g_capture_owner.compare_exchange_strong(expected, this) && expected != this) {
+            if (!capture_conflict_noted_) {
+                capture_conflict_noted_ = true;
+                note_locked("another Client holds automatic error capture in this process; "
+                            "this one does not capture",
+                            false);
+            }
+            return;
+        }
+        capture_installed_ = true;
+        if (!crash_path_.empty()) {
+            detail::install_terminate_handler(crash_path_);
+            if (config_.install_signal_handlers) {
+                detail::install_signal_handlers(signal_path_);
+            }
+        }
+        read_crash_records_locked();
+    }
+
+    void uninstall_capture_locked() {
+        if (!crash_path_.empty()) {
+            detail::uninstall_terminate_handler();
+            if (config_.install_signal_handlers) {
+                detail::uninstall_signal_handlers();
+            }
+        }
+        const void* self = this;
+        g_capture_owner.compare_exchange_strong(self, nullptr);
+        capture_installed_ = false;
+        held_captures_.clear();
+        trail_.clear();
+    }
+
+    // What the previous run saved as it died: one event each, sent through
+    // the same caps and boot hold as anything else. The file is removed on
+    // reading, so a crash is sent at most once.
+    void read_crash_records_locked() {
+        std::string text;
+        detail::CrashRecord record;
+        if (!crash_path_.empty() && detail::read_text_file(crash_path_, text)) {
+            detail::remove_file(crash_path_);
+            if (detail::parse_crash(text, record)) {
+                capture_locked("critical", "crash", record.type, record.message, "",
+                               record.timestamp);
+            }
+        }
+        if (!signal_path_.empty() && detail::read_text_file(signal_path_, text)) {
+            detail::remove_file(signal_path_);
+            if (detail::parse_signal_record(text, record)) {
+                capture_locked("critical", "crash", record.type, record.message, "",
+                               record.timestamp);
+            }
+        }
+    }
+
+    void discard_crash_records_locked() {
+        if (!crash_path_.empty()) {
+            detail::remove_file(crash_path_);
+            detail::remove_file(signal_path_);
+        }
+    }
+
+    // A new identity starts a new run's caps and trail.
+    void reset_capture_run_locked() {
+        limiter_.reset();
+        trail_.clear();
+        held_captures_.clear();
+    }
+
+    // One automatic capture: scrubbed on the device, cut, capped, then held
+    // (before the server's answer) or queued behind gameplay events.
+    void capture_locked(const std::string& severity, const std::string& source,
+                        const std::string& type, const std::string& raw_message,
+                        const std::string& raw_stack, long long timestamp) {
+        if (!capture_installed_) {
+            return;
+        }
+        const std::string message =
+            detail::trim(detail::scrub_field(raw_message, detail::error_message_chars));
+        if (message.empty()) {
+            return;
+        }
+        const std::string stack = detail::scrub_field(raw_stack, detail::error_stack_chars);
+        const std::string error_type = detail::cut_chars(type, detail::error_type_chars);
+        const std::string first_frame = stack.substr(0, stack.find('\n'));
+        const std::string key =
+            error_type + "|" + detail::message_template(message) + "|" + first_frame;
+        if (!limiter_.allow(key, now_unix_seconds())) {
+            return; // over a device cap: dropped silently
+        }
+        EventData data{{"rs_kind", "error"},
+                       {"rs_severity", severity},
+                       {"rs_source", source},
+                       {"rs_message", message}};
+        if (!error_type.empty()) {
+            data.emplace_back("rs_error_type", error_type);
+        }
+        if (!stack.empty()) {
+            data.emplace_back("rs_stack", stack);
+        }
+        if (capture_trail_ && !trail_.empty() && limiter_.take_trail()) {
+            data.emplace_back("rs_trail", trail_.text());
+        }
+        Event event;
+        event.name = "error";
+        event.data_json = write_fields(data);
+        event.timestamp = timestamp > 0 ? timestamp : static_cast<long long>(now_unix_seconds());
+        event.automatic_error = true;
+        if (!capture_known_) {
+            // A boot error: held until the game's switch is known.
+            if (held_captures_.size() < detail::max_held_captures) {
+                held_captures_.push_back(std::move(event));
+            }
+            return;
+        }
+        enqueue_locked(std::move(event));
+    }
+
+    // errorCapture: {enabled, trail} from a settings or session answer.
+    // Absent leaves a known switch alone and otherwise means the default:
+    // enabled, no trail. Held boot errors are then queued or discarded.
+    void apply_capture_answer_locked(const json::Value& answer) {
+        const json::Value* value = answer.find("errorCapture");
+        if (value != nullptr && value->is_object()) {
+            bool enabled = true;
+            capture_server_enabled_ = !(value->get_bool("enabled", enabled) && !enabled);
+            bool trail = false;
+            capture_trail_ = value->get_bool("trail", trail) && trail;
+            capture_known_ = true;
+        } else if (!capture_known_) {
+            capture_server_enabled_ = true;
+            capture_trail_ = false;
+            capture_known_ = true;
+        }
+        if (!capture_trail_) {
+            trail_.clear();
+        }
+        std::vector<Event> held;
+        held.swap(held_captures_);
+        update_capture_locked();
+        if (capture_installed_ && queue_.is_active()) {
+            for (Event& event : held) {
+                enqueue_locked(std::move(event));
+            }
+        }
+    }
+
     // --- Failure handling ---------------------------------------------------
 
     // Stops sending for the rest of the run and clears the queue.
@@ -1112,6 +1442,7 @@ private:
         last_error_ = error_code.empty() ? to_string(reason) : error_code;
         queue_.set_server_tracking_enabled(false);
         queue_.invalidate_session();
+        update_capture_locked();
         note_locked(message, true);
     }
 
@@ -1212,7 +1543,9 @@ private:
             if (!enabled) {
                 stop_locked(Status::tracking_disabled, "tracking_disabled",
                             "tracking disabled by the server kill switch, sending stopped for this run");
+                return;
             }
+            apply_capture_answer_locked(response.parse_json());
             return;
         }
         if (handle_refusal(response)) {
@@ -1310,6 +1643,7 @@ private:
                     return false;
                 }
                 queue_.set_session(token, expires_at);
+                apply_capture_answer_locked(parsed);
                 if (join_token_ == join_token) {
                     join_token_.clear();
                 }
@@ -1719,6 +2053,19 @@ private:
     bool nudge_ = false;
     bool wake_ = false;
     const std::shared_ptr<int> report_owner_ = std::make_shared<int>(0);
+    // Automatic error capture, guarded by mutex_.
+    bool capture_wanted_ = true;
+    bool capture_installed_ = false;
+    bool capture_known_ = false;
+    bool capture_server_enabled_ = true;
+    bool capture_trail_ = false;
+    bool capture_conflict_noted_ = false;
+    std::vector<Event> held_captures_;
+    detail::CaptureLimiter limiter_;
+    detail::Trail trail_;
+    std::string crash_path_;
+    std::string signal_path_;
+    const std::chrono::steady_clock::time_point run_start_ = std::chrono::steady_clock::now();
     bool shutdown_requested_ = false;
 
     std::thread worker_;
@@ -1745,6 +2092,9 @@ bool Client::track(const std::string& event_name, const EventData& data) {
 }
 
 void Client::sample_frame(double dt_seconds) { impl_->sample_frame(dt_seconds); }
+
+void Client::set_error_capture(bool enabled) { impl_->set_error_capture(enabled); }
+bool Client::is_error_capture_active() const { return impl_->is_error_capture_active(); }
 
 void Client::flush() { impl_->flush(); }
 

@@ -4,6 +4,7 @@
 // crash records) and, on POSIX, the real terminate and signal hooks in a
 // forked child process. No network.
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <exception>
@@ -95,6 +96,22 @@ RS_TEST(scrub_is_idempotent) {
     const std::string once =
         scrub("bob@x.io at https://h.io/a?b=1 from 10.0.0.1 gt_pub_abc Bearer t /home/me/x");
     CHECK_EQ(scrub(once), once);
+}
+
+RS_TEST(scrub_field_cuts_before_and_after_so_huge_input_is_fast) {
+    std::string huge;
+    while (huge.size() < 200000) {
+        huge += "user a@b.io at /home/me/x 10.0.0.1 Face::Add abc123def456ghi789jkl012mno345pqr678 ";
+    }
+    huge.resize(200000);
+    const auto started = std::chrono::steady_clock::now();
+    const std::string out = scrub_field(huge, error_message_chars);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    CHECK(seconds < 1.0);
+    CHECK(out.size() <= error_message_chars);
+    CHECK(out.find("a@b.io") == std::string::npos);
+    CHECK(out.find("Face::Add") != std::string::npos);
 }
 
 RS_TEST(message_template_replaces_variable_parts) {
