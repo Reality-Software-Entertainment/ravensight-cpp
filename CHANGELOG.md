@@ -2,6 +2,34 @@
 
 All notable changes to this library are documented here.
 
+## Unreleased
+
+### Added
+
+* **Automatic error capture**, on by default through `Config::error_capture`.
+  Once a client has a key and consent it installs a chained `std::terminate`
+  handler: an uncaught exception (type and `what()`) or a `std::terminate`
+  call is written to a small file and sent on the next launch as one `error`
+  event, `rs_source: "crash"`, `rs_severity: "critical"`.
+* `ravensight::log(level, message)` and `ravensight::log_sink()`, the one
+  host line that routes the game's log in: every line feeds the trail and an
+  error or critical line is sent as `rs_source: "log"`, `rs_severity:
+  "warning"`. `ravensight::parse_log_level` reads level names.
+* `Config::install_signal_handlers` (off by default, POSIX only): fatal
+  signals recorded with async-signal-safe writes and chained.
+* `client.set_error_capture(bool)` and `client.is_error_capture_active()`.
+* The game's `errorCapture` switch from the settings and session answers;
+  boot errors held (at most 5) until it is known.
+* Device caps (30 a run, 3 per key, 6 a minute, 10 trails), the contract's
+  scrub with the shared vectors, and the opt-in trail.
+
+### Changed
+
+* Gameplay events always stay ahead of captured errors in the queue; at the
+  cap a captured error is dropped first.
+* A `413` on a batch is handled like a `400`: split, then the one event is
+  dropped, never retried as is.
+
 ## [0.3.1] - Unreleased (held)
 
 - Add prepared Player Reports with bounded encoded screenshots, SHA-256, credential-free multipart upload, explicit status/cancel and stable retries.

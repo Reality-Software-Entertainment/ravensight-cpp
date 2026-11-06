@@ -126,6 +126,8 @@ Everything game code needs is on `ravensight::Client`:
 | `client.track_resource(flow, resource, amount, ...)` | Typed resource source or sink event. |
 | `client.track_progression(status, p1, p2, p3, score, ...)` | Typed progression start, complete or fail event. |
 | `client.track_error(severity, message, stack, ...)` | Typed error event, message and stack cut to the limits. |
+| `client.set_error_capture(bool)` | Turns automatic error capture on or off for this run. Not saved. See [Error capture](#error-capture-unreleased). |
+| `client.is_error_capture_active()` | True while this client holds automatic error capture. |
 | `client.sample_frame(dt_seconds)` | Call once per frame. With `Config::performance` it samples the frame rate once a second. |
 | `client.flush()` | Asks the worker to flush now. Non blocking. |
 | `client.flush_and_wait(timeout)` | Flushes and waits for the queue to drain. Blocking. |
@@ -144,7 +146,9 @@ Everything game code needs is on `ravensight::Client`:
 | `client.stats()` | Queued, sent, dropped, batch and session counters, and the last error code. |
 | `client.shutdown()` | `game_exited`, a final flush and worker join. The destructor calls it too. |
 
-Free functions: `ravensight::set_tracking_enabled(config, bool)` saves the
+Free functions: `ravensight::log(level, message)` and `ravensight::log_sink()`
+feed your game's log to error capture, `ravensight::parse_log_level(name, level)`
+reads a level name, `ravensight::set_tracking_enabled(config, bool)` saves the
 player's choice before a client exists, `ravensight::apply_playtest_args(config, argc, argv)`
 reads the playtest command line flags, `ravensight::default_storage_dir(key)`
 returns the default storage path, and `ravensight::feedback_categories` lists
@@ -223,6 +227,105 @@ client.track_purchase(99, "usd", "skin", "red_cape", "", "",
                       {{"source", "shop"}}, "iap");
 ```
 
+## Error capture (Unreleased)
+
+Errors in a live game go unnoticed unless something reports them. The SDK
+reports them as ordinary `error` events: one captured error is one event on
+the shared event meter, and spend is bounded on the device by the caps
+below.
+
+### What is automatic and what needs one line
+
+C++ has no engine for the SDK to hook, so "on by default" means this:
+
+| What | How it starts | What is sent |
+| --- | --- | --- |
+| An uncaught exception, or any `std::terminate` call | **Automatic.** A `Client` with `Config::error_capture` (default `true`) installs a `std::terminate` handler once it has a key and consent. | On the **next launch**: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` (the exception's type, for example `std::runtime_error`) and `rs_message` (its `what()`). |
+| Your game's log | **One host line.** Route your logger to `ravensight::log(level, message)`, or hand it `ravensight::log_sink()`. | Every line feeds the trail; a line at `LogLevel::error` or `critical` is sent as `rs_source: "log"`, `rs_severity: "warning"`. |
+| Fatal signals (`SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGABRT`) | **Opt in**, POSIX only: `Config::install_signal_handlers = true`. Off by default. | On the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type: "SIGSEGV"`. |
+| `client.track_error(...)` | Your call, as before. | As you wrote it, never blocked by the switches below. |
+
+```cpp
+ravensight::Config config;
+config.ingest_key = RAVENSIGHT_KEY;
+ravensight::Client client(config);   // the terminate handler is now installed
+
+// The one host line: wherever your game logs.
+void my_log(MyLevel level, const std::string& text) {
+    ravensight::LogLevel rs = ravensight::LogLevel::info;
+    ravensight::parse_log_level(my_level_name(level), rs);  // "warn", "error", "fatal", ...
+    ravensight::log(rs, text);
+}
+```
+
+`ravensight::log` is thread safe, never blocks on the network and never
+throws. It reaches the first `Client` built with a key; a second `Client` in
+the same process (a dedicated server with one client per player, say) does
+not capture, and `is_error_capture_active()` says which one does.
+
+### How a crash is sent
+
+The terminate handler records the active exception's type and `what()` (or
+`std::terminate called without an active exception`), writes one small file
+synchronously (`crash` in the storage directory), then calls the handler that
+was installed before it, or `std::abort` when there was none. The game dies
+exactly as it would have. The next launch with a key and consent reads the
+file, deletes it, scrubs the text and sends one event. A crash is sent at most
+once. There is no stack: C++17 has no portable stack trace, so pass one
+through `track_error` if your game has its own.
+
+The signal handlers write only with `open`, `write` and `close`, which are
+async-signal-safe, then chain to the previous action (or restore the default
+and raise again). After an uncaught exception, the `SIGABRT` that
+`std::abort` raises does not write a second record. A stack overflow may not
+be recorded, because no alternate signal stack is installed. Playtest runs
+keep nothing on disk, so they do not record crashes; the log sink still works.
+
+### The gate
+
+Nothing is installed and nothing is sent:
+
+* without a key (an inert client),
+* before consent (`Consent::opt_in` before the yes, or after an opt-out;
+  saying no also deletes any saved crash),
+* while the game's **Errors** switch on the server is off
+  (`errorCapture.enabled` on the settings and session answers; an answer
+  without it means on),
+* with `Config::error_capture = false` or `client.set_error_capture(false)`.
+
+**Boot errors.** With a key and consent, capture starts before the server's
+first answer. Up to 5 captures are held in memory until it arrives: sent when
+it says capture is on, discarded unsent otherwise. A saved crash goes through
+the same hold.
+
+### Caps, scrubbing and the trail
+
+* **Caps per run**, dropped silently on the device: 30 captures, 3 per local
+  key (type, message with numbers, ids and quoted text templated away, and
+  the first stack line), a token bucket of 6 a minute, and 10 trails. A
+  `Client` run is one session unless it expires; a new device id
+  (`reset_device_id`) starts the caps again.
+* **Scrubbed on the device** before queueing, with the server's rules:
+  emails become `[email]`; `Bearer` tokens, JWT-shaped strings, `gt_` keys
+  and runs of 32 or more of `A-Z a-z 0-9 + / = _ -` that contain a digit
+  become `[token]` (a run that is a file path, every `/` piece a plain
+  word, is kept); IPv4 and IPv6 become `[ip]`; `/Users/<name>`,
+  `/home/<name>` and `C:\Users\<name>` become `~`; a URL loses its query,
+  fragment and `user:password@`. Text is cut to 4 times the field's limit
+  before scrubbing, then to the limit: message 200 characters, type 100.
+* **The trail** is an in-memory ring of the last 20 lines (log lines at any
+  level, and the names of events you track), `+<ms since start> <level> <text>`,
+  each scrubbed and cut to 120 characters, at most 1,500 in all. It is sent
+  only with an error, only when the game's trail switch
+  (`errorCapture.trail`, off by default) is on, and never written to disk.
+* **Never sent:** request bodies, headers, query strings, the SDK's own log
+  lines (anything starting with `Ravensight`, and anything your
+  `Config::log` sink hands back to `ravensight::log`), and `rs_fp` (the
+  server computes the fingerprint).
+* **Queue order.** Gameplay events always stay ahead of captured errors in
+  the queue, and at the queue cap a captured error is dropped first, so an
+  error storm never costs a gameplay event.
+
 ### Health sampling
 
 Performance sampling is opt in. Set `Config::performance = true` and call
@@ -272,13 +375,16 @@ The session request also carries `"sdk": "cpp/<version>"`.
 | `enabled` | on | Start with the client off. Never saved. |
 | `join_token` | empty | A session token from the player's client, sent once as `joinToken` (see [Dedicated servers](#dedicated-servers)). |
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | empty | Playtest overrides. Normally read from the environment (see [Playtest](#playtest)). |
+| `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture-unreleased). |
+| `install_signal_handlers` | off | POSIX only: also record fatal signals for the next launch. |
 | `log` | none | Optional log sink, called from the worker thread. Without one, warnings go to stderr. |
 | `on_status` | none | Optional, called on the worker thread when `status()` changes. |
 
 ## Automatic events
 
-Exactly two events are sent without a `track` call, unless
-`track_lifecycle_events` is off:
+Two lifecycle events are sent without a `track` call, unless
+`track_lifecycle_events` is off (captured errors are described in
+[Error capture](#error-capture-unreleased)):
 
 * `game_started`, queued once when the client is constructed, so it is the
   first event and carries the real start time. A client constructed
@@ -398,8 +504,8 @@ Rotate it from the dashboard at any time.
 * **Rate limits.** A `429` (or a `503` with `Retry-After`) waits exactly
   `Retry-After` seconds. With no such header the SDK backs off
   exponentially from 10 seconds to a 5 minute ceiling.
-* **Oversize batches.** A `400` halves the batch and retries down to a
-  single event.
+* **Oversize batches.** A `400` or a `413` halves the batch and retries down
+  to a single event, which is then dropped, never retried as is.
 * **Kill switch.** `GET /settings` is read once, when the client first may
   send. If the server has tracking off for your game, the queue is cleared
   and nothing is sent.
@@ -432,9 +538,12 @@ include/ravensight/
   transport.hpp        Request, Response, the Transport seam
   curl_transport.hpp   the built in libcurl transport
   json.hpp             small JSON writer and reader
+  error_capture.hpp    LogLevel, ravensight::log and log_sink
   version.hpp          RAVENSIGHT_VERSION
 src/
   storage.hpp/.cpp     storage directory, files, SHA-256, random bytes
+  error_capture.hpp/.cpp  scrub, caps, trail, crash records, terminate and
+                       signal hooks
 ```
 
 `Queue` makes every batching, backoff and retry decision as a pure function
@@ -461,7 +570,11 @@ playtest path, the session hand-off, acknowledgment by sequence and the
 lifecycle once-guards, plus the public build rules: an inert client with no
 key, opt-in before and after the yes, `distribution` on the session body,
 the backoff jitter bounds, the `rs_event_id` shape, resend and relaunch,
-and the 8,192 byte cap.
+and the 8,192 byte cap. Error capture is covered by the shared scrub vectors
+(`tests/fixtures/scrub-vectors.json`, copied from the platform's contract),
+the caps, the trail, the boot hold, the game's switch, queue order, the 413
+split, a saved crash sent once, and, on POSIX, a forked child that really
+throws an uncaught exception and really raises a signal.
 
 ## Device id and storage
 
