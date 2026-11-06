@@ -293,6 +293,9 @@ public:
     void count_dropped(int count) { dropped_count_ += count; }
 
 private:
+    /// True for an event carried by the batch in flight.
+    bool is_in_flight(unsigned long long sequence) const;
+
     /// Removes the plan's events still queued, found by sequence.
     int remove_sent(const FlushPlan& plan);
 
@@ -307,6 +310,7 @@ private:
     bool server_tracking_enabled_ = true;
     bool locally_enabled_ = true;
     bool flush_in_progress_ = false;
+    std::vector<unsigned long long> in_flight_;
 
     std::string session_token_;
     double session_expires_at_seconds_ = 0.0;

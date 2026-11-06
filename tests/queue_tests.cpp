@@ -497,3 +497,57 @@ RS_TEST(accepting_a_batch_removes_its_events_even_after_an_insert_ahead) {
     const std::vector<std::string> expected{"event_2"};
     CHECK(names(queue) == expected);
 }
+
+RS_TEST(a_capture_in_a_batch_in_flight_is_never_evicted) {
+    Queue queue;
+    queue.set_max_queue_size(2);
+    queue.set_session("st", 10000.0);
+    queue.enqueue(make_capture(1));
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.batch.size() == std::size_t(1));
+    queue.enqueue(make_event(1));
+    // The only capture is in flight: an incoming capture is dropped instead.
+    CHECK_EQ(queue.enqueue(make_capture(2)), 1);
+    std::vector<std::string> expected{"event_1", "error_1"};
+    CHECK(names(queue) == expected);
+    // A gameplay event drops the oldest event that is not in flight.
+    queue.enqueue(make_event(2));
+    expected = {"event_2", "error_1"};
+    CHECK(names(queue) == expected);
+    CHECK_EQ(queue.on_batch_accepted(plan), 1);
+    queue.end_flush();
+    expected = {"event_2"};
+    CHECK(names(queue) == expected);
+}
+
+// --- The queue rules agreed for every SDK -----------------------------------------
+
+RS_TEST(rule_1_a_games_own_error_is_gameplay_and_goes_before_captures) {
+    Queue queue;
+    queue.enqueue(make_capture(1));
+    Event own = make_event(1);
+    own.name = "own_error";
+    own.data_json = "{\"rs_kind\":\"error\",\"rs_source\":\"crash\"}"; // no capture flag
+    queue.enqueue(own);
+    queue.enqueue(make_capture(2));
+    queue.enqueue(make_event(2));
+    const std::vector<std::string> expected{"own_error", "event_2", "error_1", "error_2"};
+    CHECK(names(queue) == expected);
+}
+
+RS_TEST(rule_2_an_incoming_capture_evicts_the_oldest_capture_never_gameplay) {
+    Queue queue;
+    queue.set_max_queue_size(3);
+    queue.enqueue(make_event(1));
+    queue.enqueue(make_capture(1));
+    queue.enqueue(make_event(2));
+    CHECK_EQ(queue.enqueue(make_capture(2)), 1);
+    std::vector<std::string> expected{"event_1", "event_2", "error_2"};
+    CHECK(names(queue) == expected);
+    queue.enqueue(make_event(3));
+    expected = {"event_1", "event_2", "event_3"};
+    CHECK(names(queue) == expected);
+    CHECK_EQ(queue.enqueue(make_capture(3)), 1); // no capture queued: dropped
+    CHECK(names(queue) == expected);
+    CHECK_EQ(queue.stats().dropped, 3);
+}

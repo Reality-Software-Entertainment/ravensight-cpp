@@ -513,7 +513,11 @@ a lost connection, a crash, a kill and a build update.
   timer, as soon as 50 events are queued, on `flush()` and at shutdown, up
   to 50 events per request (the server limit), until the queue drains.
 * **Captured errors last.** Automatic error captures queue behind every
-  gameplay event, and at the cap a capture is dropped first.
+  gameplay event (your own `track_error` counts as gameplay). At the cap the
+  oldest capture goes first, whichever event is coming in; a capture never
+  pushes out a gameplay event (with no capture queued, an incoming capture
+  is dropped), and a capture in a batch already in flight is never evicted.
+  An error's `rs_trail` is never written to the queue file.
 * **Persisted queue.** Unsent events are kept in
   `queue-<16 hex>.json` in the storage directory (64-bit FNV-1a of the
   ingest key), written atomically through a temporary file within about a
@@ -700,8 +704,19 @@ on the session:
 Each is trimmed, kept to printable characters and cut to 128 characters;
 an empty field is not sent. Country is never sent by the SDK.
 
-The storage directory also holds the queue file, `attribution_sent`, and
-the config cache.
+The storage directory also holds the queue file
+(`queue-<16 hex>.json`, 64-bit FNV-1a of the ingest key), `attribution_sent`,
+the config cache, and error capture's crash records.
+
+**Keep it out of backups.** The queue file holds scrubbed error captures and
+origin stamps (a credential for an earlier session of this device), and the
+device id is per install. The library does not mark files itself. On a
+platform that backs up app data (iCloud or iTunes on iOS and macOS, Auto
+Backup on Android, console save sync), exclude the whole storage directory:
+on Apple set `NSURLIsExcludedFromBackupKey` on it, on Android add
+`<exclude domain="file" path="..."/>` for it to your backup rules (or set
+`storage_dir` to a path under `getNoBackupFilesDir()`), and keep it out of
+any cloud save set.
 
 ## Opting out and resetting
 

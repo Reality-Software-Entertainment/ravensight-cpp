@@ -265,6 +265,21 @@ RS_TEST(opting_out_deletes_the_queue_file) {
     CHECK(!fs::exists(queue_path(config)));
 }
 
+RS_TEST(rule_3_a_device_id_reset_deletes_the_queue_file) {
+    const std::string dir = rstest::make_temp_dir();
+    Config config = wave_config(dir);
+    auto server = std::make_shared<Server>();
+    server->respond = [](const Request& request) {
+        return ends_with(request.url, "/track/batch") ? reply(0, "") : pass;
+    };
+    Client client(config, std::make_unique<Wire>(server));
+    client.track("a");
+    client.flush_and_wait(1.0);
+    REQUIRE(wait_for([&] { return fs::exists(queue_path(config)); }));
+    client.reset_device_id();
+    CHECK(!fs::exists(queue_path(config)));
+}
+
 // --- Response table --------------------------------------------------------------
 
 RS_TEST(a_403_keeps_the_events_for_the_next_launch) {

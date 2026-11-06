@@ -59,6 +59,32 @@ std::string origin_session(const std::string& origin_json) {
     return json::Value::parse(origin_json).get_string("session", "");
 }
 
+namespace {
+
+/// The event's data as written to the queue file: an error's rs_trail never
+/// reaches disk (the queue rules, rule 3); the event in memory keeps it.
+std::string data_for_file(const std::string& data_json) {
+    if (data_json.empty()) {
+        return "{}";
+    }
+    if (data_json.find("\"rs_trail\"") == std::string::npos) {
+        return data_json;
+    }
+    const json::Value data = json::Value::parse(data_json);
+    if (!data.is_object()) {
+        return data_json;
+    }
+    json::ObjectWriter writer;
+    for (const auto& member : data.members()) {
+        if (member.first != "rs_trail") {
+            writer.add_raw(member.first, member.second.dump());
+        }
+    }
+    return writer.str();
+}
+
+} // namespace
+
 std::string write_queue_file(const std::deque<Event>& events) {
     std::string out = "{\"version\":2,\"groups\":[";
     bool first_group = true;
@@ -82,7 +108,7 @@ std::string write_queue_file(const std::deque<Event>& events) {
             first_event = false;
             out += "{\"event\":" + json::escape_string(events[i].name) +
                    ",\"timestamp\":" + std::to_string(events[i].timestamp) +
-                   ",\"data\":" + (events[i].data_json.empty() ? "{}" : events[i].data_json) +
+                   ",\"data\":" + data_for_file(events[i].data_json) +
                    (events[i].automatic_error ? ",\"automaticError\":true" : "") + "}";
         }
         out += "]}";

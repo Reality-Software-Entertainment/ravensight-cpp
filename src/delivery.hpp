@@ -41,7 +41,7 @@ std::string fnv1a64_hex(const std::string& text);
 std::string queue_file_name(const std::string& ingest_key);
 
 /// The queue as a version 2 file: consecutive events with the same origin
-/// form one group. Session tokens are never written.
+/// form one group. Session tokens and an error's rs_trail are never written.
 std::string write_queue_file(const std::deque<Event>& events);
 
 /// What read_queue_file found.

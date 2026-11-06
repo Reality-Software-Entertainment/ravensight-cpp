@@ -28,6 +28,11 @@ device field contracts.
 
 * The queue file keeps `Event::automatic_error`, so captured errors stay
   behind gameplay events, and are evicted first, after a restart too.
+* The queue rules agreed for every SDK: a capture in a batch in flight is
+  never evicted, and an error's `rs_trail` is never written to the queue
+  file (a restored capture goes without its trail).
+* The README says where the queue file lives and how to keep the storage
+  directory out of device backups.
   Capture records keep unix seconds; their events are queued in
   milliseconds like every other.
 * Event timestamps are unix milliseconds, set when the event is tracked.

@@ -241,3 +241,17 @@ RS_TEST(queue_file_keeps_the_automatic_error_flag) {
     CHECK(!loaded.events[0].automatic_error);
     CHECK(loaded.events[1].automatic_error);
 }
+
+RS_TEST(rule_3_rs_trail_never_reaches_the_queue_file) {
+    Event capture = event_at("error", 1000);
+    capture.automatic_error = true;
+    capture.data_json = "{\"rs_kind\":\"error\",\"rs_message\":\"boom\",\"rs_trail\":\"secret trail\",\"rs_event_id\":\"e\"}";
+    const std::deque<Event> events{capture};
+    const std::string text = detail::write_queue_file(events);
+    CHECK(text.find("rs_trail") == std::string::npos);
+    CHECK(text.find("secret trail") == std::string::npos);
+    const detail::LoadedQueue loaded = detail::read_queue_file(text, 2000, 500);
+    REQUIRE(loaded.events.size() == 1);
+    CHECK(loaded.events[0].automatic_error);
+    CHECK(loaded.events[0].data_json.find("\"rs_message\":\"boom\"") != std::string::npos);
+}

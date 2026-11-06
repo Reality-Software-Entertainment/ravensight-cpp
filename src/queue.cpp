@@ -17,8 +17,12 @@ int Queue::enqueue(Event event) {
     }
     int dropped = 0;
     if (static_cast<int>(events_.size()) >= max_queue_size_) {
-        const auto first_capture = std::find_if(events_.begin(), events_.end(),
-                                                [](const Event& e) { return e.automatic_error; });
+        // The queue rule for every SDK: the oldest capture goes first,
+        // whichever event is coming in, but never one in a batch in flight;
+        // a capture never evicts a gameplay event.
+        const auto first_capture = std::find_if(events_.begin(), events_.end(), [this](const Event& e) {
+            return e.automatic_error && !is_in_flight(e.sequence);
+        });
         if (first_capture != events_.end()) {
             events_.erase(first_capture);
             ++dropped_count_;
@@ -124,11 +128,16 @@ FlushPlan Queue::begin_flush(double now_seconds, bool force) {
         static_cast<std::size_t>(std::min(limits::max_batch_size, batch_limit_)));
     plan.batch.assign(events_.begin(), events_.begin() + static_cast<std::ptrdiff_t>(size));
     flush_in_progress_ = true;
+    in_flight_.clear();
+    for (const Event& event : plan.batch) {
+        in_flight_.push_back(event.sequence);
+    }
     return plan;
 }
 
 void Queue::end_flush() {
     flush_in_progress_ = false;
+    in_flight_.clear();
 }
 
 void Queue::on_batch_accepted(std::size_t batch_size) {
@@ -292,11 +301,19 @@ QueueStats Queue::stats() const {
     return stats;
 }
 
+bool Queue::is_in_flight(unsigned long long sequence) const {
+    return std::find(in_flight_.begin(), in_flight_.end(), sequence) != in_flight_.end();
+}
+
 int Queue::trim_to_cap(int headroom) {
     const int target = std::max(0, max_queue_size_ - headroom);
     int dropped = 0;
     while (static_cast<int>(events_.size()) > target) {
-        events_.pop_front();
+        // The oldest event, unless it is a capture already on its way.
+        auto victim = std::find_if(events_.begin(), events_.end(), [this](const Event& e) {
+            return !(e.automatic_error && is_in_flight(e.sequence));
+        });
+        events_.erase(victim == events_.end() ? events_.begin() : victim);
         ++dropped;
     }
     if (dropped > 0) {
