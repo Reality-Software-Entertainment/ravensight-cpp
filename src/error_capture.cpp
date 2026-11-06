@@ -170,8 +170,11 @@ std::string scrub(const std::string& input) {
     static const regex jwt(R"(\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)");
     static const regex gt_key(R"(\bgt_[A-Za-z0-9_]+)");
     static const regex email(R"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})");
-    static const regex home_windows(R"(\b[A-Za-z]:[\\/]Users[\\/][^\\/\s'"]+)", ECMAScript | icase);
-    static const regex home_unix(R"(/(?:Users|home)/[^/\s'"]+)");
+    // A home folder is the whole segment up to the next slash, quote, <, >,
+    // ':' or end of line, spaces included (contract 5): a name can be Jo Ann.
+    static const regex home_windows(
+        R"(\b[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^/\\'"<>:\r\n]+)", ECMAScript | icase);
+    static const regex home_unix(R"(/(?:Users|home)/[^/\\'"<>:\r\n]+)");
     static const regex ipv4(R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)");
     static const regex ipv6_full(R"(\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b)", ECMAScript | icase);
     static const regex ipv6_short(

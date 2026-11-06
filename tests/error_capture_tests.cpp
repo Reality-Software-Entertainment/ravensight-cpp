@@ -37,7 +37,7 @@ RS_TEST(scrub_matches_the_contract_rules) {
         {"key gt_live_ab12CD34 and gt_mcp_x", "key [token] and [token]"},
         {"at /Users/jacob/game/main.cpp:1", "at ~/game/main.cpp:1"},
         {"at /home/al/game/main.cpp", "at ~/game/main.cpp"},
-        {"at C:\\Users\\Jo Ann\\x.cpp", "at ~ Ann\\x.cpp"},
+        {"at C:\\Users\\Jo Ann\\x.cpp", "at ~\\x.cpp"},
         {"at C:/Users/jo/x.cpp", "at ~/x.cpp"},
         {"from 192.168.1.10 ok", "from [ip] ok"},
         {"from 2001:db8::1 and ::1 ok", "from [ip] and [ip] ok"},

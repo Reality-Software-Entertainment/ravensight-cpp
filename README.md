@@ -324,7 +324,8 @@ the same hold.
   and runs of 32 or more of `A-Z a-z 0-9 + / = _ -` that contain a digit
   become `[token]` (a run that is a file path, every `/` piece a plain
   word, is kept); IPv4 and IPv6 become `[ip]`; `/Users/<name>`,
-  `/home/<name>` and `C:\Users\<name>` become `~`; a URL loses its query,
+  `/home/<name>`, `C:\Users\<name>` and `C:\Documents and Settings\<name>`
+  become `~`, the whole name, spaces included; a URL loses its query,
   fragment and `user:password@`. Text is cut to 4 times the field's limit
   before scrubbing, then to the limit: message 200 characters, type 100.
 * **The trail** is an in-memory ring of the last 20 lines (log lines at any

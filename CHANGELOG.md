@@ -27,6 +27,8 @@ All notable changes to this library are documented here.
   boot errors held (at most 5) until it is known.
 * Device caps (30 a run, 3 per key, 6 a minute, 10 trails), the contract's
   scrub with the shared vectors, and the opt-in trail.
+* A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 
 ### Changed
 
