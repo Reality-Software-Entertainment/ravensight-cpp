@@ -84,17 +84,33 @@ bool in_token_class(char c) {
            c == '/' || c == '=' || c == '_' || c == '-';
 }
 
-/// One '/' piece of a path: empty, snake or kebab lower case, PascalCase,
-/// or a short upper case word, under 32 characters.
+/// One '/' piece of a path: empty, or under 32 characters and one or more
+/// parts joined by '_' or '-', each part lower case, PascalCase, or an
+/// acronym of 1 to 6 capitals or digits (so BP_Player_Controller_2026 is a word).
 bool is_path_word(const std::string& piece) {
-    static const regex lower(R"(^[a-z0-9]+([_-][a-z0-9]+)*$)");
+    static const regex lower(R"(^[a-z0-9]+$)");
     static const regex pascal(R"(^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$)");
     static const regex upper(R"(^[A-Z0-9]{1,6}$)");
+    if (piece.empty()) {
+        return true;
+    }
     if (piece.size() >= 32) {
         return false;
     }
-    return piece.empty() || std::regex_match(piece, lower) || std::regex_match(piece, pascal) ||
-           std::regex_match(piece, upper);
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t sep = piece.find_first_of("_-", start);
+        const std::string part =
+            piece.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+        if (part.empty() || !(std::regex_match(part, lower) || std::regex_match(part, pascal) ||
+                              std::regex_match(part, upper))) {
+            return false;
+        }
+        if (sep == std::string::npos) {
+            return true;
+        }
+        start = sep + 1;
+    }
 }
 
 /// A run with a '/' whose every piece is a path word: a file path, kept.
