@@ -20,6 +20,7 @@ add_library(ravensight
     src/remote_config.cpp
     src/client.cpp
     src/curl_transport.cpp
+    src/error_capture.cpp
     src/health.cpp
     src/json.cpp
     src/queue.cpp
@@ -71,9 +72,12 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/client_tests.cpp
         tests/storage_tests.cpp
         tests/conformance_tests.cpp
-        tests/typed_events_tests.cpp)
+        tests/typed_events_tests.cpp
+        tests/error_capture_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
     target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_definitions(ravensight_tests PRIVATE
+        RAVENSIGHT_TEST_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures")
     if(MSVC)
         target_compile_options(ravensight_tests PRIVATE /W4)
     else()

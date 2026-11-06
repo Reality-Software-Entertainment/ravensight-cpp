@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include "error_capture.hpp"
 #include "ravensight/client.hpp"
 
 namespace ravensight {
@@ -44,20 +45,7 @@ std::string upper_ascii(std::string text) {
     return text;
 }
 
-/// Cuts to at most max_chars characters (UTF-8 code points, so a cut never
-/// leaves half a character).
-std::string cut_chars(const std::string& text, std::size_t max_chars) {
-    std::size_t chars = 0;
-    for (std::size_t i = 0; i < text.size(); ++i) {
-        if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) {
-            if (chars == max_chars) {
-                return text.substr(0, i);
-            }
-            ++chars;
-        }
-    }
-    return text;
-}
+using detail::cut_chars;
 
 void add_if_set(EventData& data, const char* key, const std::string& value) {
     if (!value.empty()) {
