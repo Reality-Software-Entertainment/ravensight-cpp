@@ -272,7 +272,8 @@ player's account only), then calls the handler that was installed before it,
 or `std::abort` when there was none. The game dies
 exactly as it would have. The next launch with a key and consent reads the
 file, deletes it, scrubs the text and sends one event. A crash is sent at most
-once. There is no stack: C++17 has no portable stack trace, so pass one
+once, and one older than 30 days, or saved before `reset_device_id()`, is
+deleted unsent. There is no stack: C++17 has no portable stack trace, so pass one
 through `track_error` if your game has its own.
 
 The signal handlers let a handler that was there before run first: a

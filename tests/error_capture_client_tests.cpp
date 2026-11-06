@@ -5,6 +5,7 @@
 // trail, the device caps, queue order, and a crash saved by the previous
 // run. No network, no libcurl, nothing near the production API.
 
+#include <ctime>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -346,9 +347,10 @@ RS_TEST(a_crash_saved_by_the_last_run_is_sent_once_on_the_next_launch) {
     detail::CrashRecord record;
     record.type = "std::runtime_error";
     record.message = "save failed for /home/sam/slot1.sav";
-    record.timestamp = 1700000000;
+    const long long now = static_cast<long long>(std::time(nullptr));
+    record.timestamp = now - 60;
     REQUIRE(detail::write_text_file(detail::join_path(dir, "crash"), detail::serialize_crash(record)));
-    REQUIRE(detail::write_text_file(detail::join_path(dir, "crash_signal"), "signal 11 1700000005\n"));
+    REQUIRE(detail::write_text_file(detail::join_path(dir, "crash_signal"), "signal 11 " + std::to_string(now - 55) + "\n"));
 
     auto fake = std::make_shared<ErrorFake>(on_no_trail);
     {
@@ -374,6 +376,52 @@ RS_TEST(a_crash_saved_by_the_last_run_is_sent_once_on_the_next_launch) {
         client.flush_and_wait(3.0);
     }
     CHECK(again->errors().empty());
+}
+
+RS_TEST(a_saved_crash_older_than_30_days_is_deleted_unsent) {
+    const std::string dir = rstest::make_temp_dir("ravensight-err-");
+    const long long now = static_cast<long long>(std::time(nullptr));
+    detail::CrashRecord record;
+    record.type = "std::runtime_error";
+    record.message = "stale";
+    record.timestamp = now - detail::max_crash_record_age_seconds - 60;
+    REQUIRE(detail::write_text_file(detail::join_path(dir, "crash"), detail::serialize_crash(record)));
+    REQUIRE(detail::write_text_file(detail::join_path(dir, "crash_signal"), "signal 11 " + std::to_string(now - 86400) + "\n"));
+    auto fake = std::make_shared<ErrorFake>(on_no_trail);
+    {
+        Client client(error_config(dir), std::make_unique<Proxy>(fake));
+        wait_ready(client);
+        client.flush_and_wait(3.0);
+    }
+    const auto errors = fake->errors();
+    REQUIRE(errors.size() == std::size_t(1));
+    CHECK_EQ(errors[0].get_string("rs_error_type", ""), std::string("SIGSEGV"));
+    std::string text;
+    CHECK(!detail::read_text_file(detail::join_path(dir, "crash"), text));
+    CHECK(!detail::read_text_file(detail::join_path(dir, "crash_signal"), text));
+}
+
+RS_TEST(a_reset_deletes_a_saved_crash_unsent) {
+    const std::string dir = rstest::make_temp_dir("ravensight-err-");
+    detail::CrashRecord record;
+    record.type = "std::runtime_error";
+    record.message = "old identity";
+    record.timestamp = static_cast<long long>(std::time(nullptr)) - 60;
+    REQUIRE(detail::write_text_file(detail::join_path(dir, "crash"), detail::serialize_crash(record)));
+    auto fake = std::make_shared<ErrorFake>(on_no_trail);
+    {
+        // Started disabled, so capture is not installed and the crash waits.
+        Config config = error_config(dir);
+        config.enabled = false;
+        Client client(config, std::make_unique<Proxy>(fake));
+        client.reset_device_id();
+        std::string text;
+        CHECK(!detail::read_text_file(detail::join_path(dir, "crash"), text));
+        client.set_enabled(true);
+        wait_ready(client);
+        client.flush_and_wait(3.0);
+    }
+    CHECK(fake->errors().empty());
 }
 
 RS_TEST(a_saved_crash_is_discarded_when_the_game_switch_is_off) {

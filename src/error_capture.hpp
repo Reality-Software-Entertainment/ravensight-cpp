@@ -30,6 +30,8 @@ inline constexpr int captures_per_key = 3;
 inline constexpr int trails_per_run = 10;
 inline constexpr int captures_per_minute = 6;
 inline constexpr std::size_t max_held_captures = 5;
+/// A saved crash record older than this is deleted unsent.
+inline constexpr long long max_crash_record_age_seconds = 30LL * 24 * 60 * 60;
 
 /// Cuts to at most max_chars characters (UTF-8 code points, so a cut never
 /// leaves half a character).

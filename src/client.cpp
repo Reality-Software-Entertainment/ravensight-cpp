@@ -1047,6 +1047,7 @@ public:
             queue_.invalidate_session();
             clear_config_locked();
             reset_capture_run_locked();
+            discard_crash_records_locked();
             schedule_settings_check_locked();
             return device_id_;
         }
@@ -1068,6 +1069,8 @@ public:
         // A session request already in flight belongs to the old id.
         clear_config_locked();
         reset_capture_run_locked();
+        // A crash saved under the old id is never sent.
+        discard_crash_records_locked();
         schedule_settings_check_locked();
         return device_id_;
     }
@@ -1372,17 +1375,22 @@ private:
         trail_.clear();
     }
 
-    // What the previous run saved as it died, prepared once at startup.
+    // What the previous run saved as it died, prepared once at startup. A
+    // record older than 30 days is never sent; its file goes with the rest.
     void load_crash_records() {
         std::string text;
         detail::CrashRecord record;
         detail::PreparedCapture capture;
-        if (detail::read_text_file(crash_path_, text) && detail::parse_crash(text, record) &&
+        const long long now = static_cast<long long>(now_unix_seconds());
+        const auto fresh = [now](const detail::CrashRecord& r) {
+            return r.timestamp <= 0 || now - r.timestamp <= detail::max_crash_record_age_seconds;
+        };
+        if (detail::read_text_file(crash_path_, text) && detail::parse_crash(text, record) && fresh(record) &&
             detail::prepare_capture("critical", "crash", record.type, record.message, "",
                                     record.timestamp, capture)) {
             pending_crashes_.push_back(capture);
         }
-        if (detail::read_text_file(signal_path_, text) && detail::parse_signal_record(text, record) &&
+        if (detail::read_text_file(signal_path_, text) && detail::parse_signal_record(text, record) && fresh(record) &&
             detail::prepare_capture("critical", "crash", record.type, record.message, "",
                                     record.timestamp, capture)) {
             pending_crashes_.push_back(capture);
