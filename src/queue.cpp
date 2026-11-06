@@ -15,9 +15,28 @@ int Queue::enqueue(Event event) {
     if (!is_active()) {
         return 0;
     }
-    const int dropped = trim_to_cap(1);
+    int dropped = 0;
+    if (static_cast<int>(events_.size()) >= max_queue_size_) {
+        const auto first_capture = std::find_if(events_.begin(), events_.end(),
+                                                [](const Event& e) { return e.automatic_error; });
+        if (first_capture != events_.end()) {
+            events_.erase(first_capture);
+            ++dropped_count_;
+            dropped = 1;
+        } else if (event.automatic_error) {
+            ++dropped_count_;
+            return 1;
+        }
+    }
+    dropped += trim_to_cap(1);
     event.sequence = next_sequence_++;
-    events_.push_back(std::move(event));
+    if (event.automatic_error) {
+        events_.push_back(std::move(event));
+    } else {
+        const auto first_capture = std::find_if(events_.begin(), events_.end(),
+                                                [](const Event& e) { return e.automatic_error; });
+        events_.insert(first_capture, std::move(event));
+    }
     return dropped;
 }
 
@@ -104,14 +123,12 @@ void Queue::on_batch_accepted(std::size_t batch_size) {
 
 int Queue::on_batch_accepted(const FlushPlan& plan) {
     int removed = 0;
-    if (!plan.batch.empty()) {
-        const unsigned long long first = plan.batch.front().sequence;
-        const unsigned long long last = plan.batch.back().sequence;
-        // Batches are always taken from the head, and sequences only grow,
-        // so the accepted events (if still queued) are a prefix.
-        while (!events_.empty() && events_.front().sequence >= first &&
-               events_.front().sequence <= last) {
-            events_.pop_front();
+    for (const Event& sent : plan.batch) {
+        const auto found = std::find_if(events_.begin(), events_.end(), [&](const Event& e) {
+            return e.sequence == sent.sequence;
+        });
+        if (found != events_.end()) {
+            events_.erase(found);
             ++removed;
         }
     }
@@ -129,13 +146,18 @@ bool Queue::on_bad_request(const FlushPlan& plan) {
         return false;
     }
     batch_limit_ = limits::max_batch_size;
-    if (batch_size == 1 && !events_.empty() &&
-        events_.front().sequence == plan.batch.front().sequence) {
-        events_.pop_front();
-        ++dropped_count_;
-        return true;
+    if (batch_size != 1) {
+        return false;
     }
-    return false;
+    const auto found = std::find_if(events_.begin(), events_.end(), [&](const Event& e) {
+        return e.sequence == plan.batch.front().sequence;
+    });
+    if (found == events_.end()) {
+        return false;
+    }
+    events_.erase(found);
+    ++dropped_count_;
+    return true;
 }
 
 void Queue::on_unauthorized() {

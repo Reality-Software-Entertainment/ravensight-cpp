@@ -65,6 +65,10 @@ struct Event {
     /// remove exactly the events it carried, even if the queue was cleared
     /// and refilled while the batch was in flight. Callers leave it at 0.
     unsigned long long sequence = 0;
+
+    /// An automatic error capture. Gameplay events always stay ahead of
+    /// these in the queue, and at the cap a capture is dropped first.
+    bool automatic_error = false;
 };
 
 /// Why a flush attempt did or did not produce a batch to send.
@@ -123,6 +127,12 @@ public:
     /// Adds an event, dropping oldest events first if the cap is already met.
     /// Returns how many were dropped to make room, so the caller can log it.
     /// A no-op returning 0 when tracking is off.
+    ///
+    /// Automatic error captures (Event::automatic_error) go behind every
+    /// gameplay event: a gameplay event is inserted ahead of any queued
+    /// capture, so an error burst never holds gameplay back. At the cap the
+    /// oldest capture is dropped first; a new capture with only gameplay
+    /// events queued is itself dropped (counted, and returned as 1).
     int enqueue(Event event);
 
     int count() const { return static_cast<int>(events_.size()); }
@@ -173,8 +183,10 @@ public:
     // --- Responses ---------------------------------------------------------
 
     /// HTTP 202 for the batch in plan. Removes only the events that batch
-    /// carried, matched by sequence number, so a 202 that lands after a
-    /// clear() and fresh enqueues cannot erase the new events. Restores the
+    /// carried, matched by sequence number wherever they now sit, so a 202
+    /// that lands after a clear() and fresh enqueues cannot erase the new
+    /// events, and a gameplay event inserted ahead of an in-flight capture
+    /// is not mistaken for it. Restores the
     /// full batch limit and clears any backoff. Returns how many were removed.
     int on_batch_accepted(const FlushPlan& plan);
 
@@ -199,8 +211,9 @@ public:
     void on_bad_request(std::size_t batch_size);
 
     /// Same as on_bad_request(plan.batch.size()), except that the single
-    /// rejected event is dropped only if it is still at the head of the
-    /// queue (it may have been cleared while the request was in flight).
+    /// rejected event is dropped only if it is still queued, found by
+    /// sequence (it may have been cleared while the request was in flight).
+    /// The client treats a 413 the same way.
     /// Returns true when an event was dropped.
     bool on_bad_request(const FlushPlan& plan);
 

@@ -1442,17 +1442,22 @@ private:
                 return;
             }
 
-            if (response.status == 400) {
+            if (response.status == 400 || response.status == 413) {
+                // A 413 (body too large) is handled exactly like a 400:
+                // split, then drop the one event that cannot go, never
+                // retry it as is.
+                const std::string http = std::to_string(response.status);
                 std::lock_guard<std::mutex> lock(mutex_);
                 const bool dropped = queue_.on_bad_request(plan);
                 queue_.end_flush();
                 if (batch_size > 1) {
-                    note_locked("batch rejected with HTTP 400, splitting", false);
+                    note_locked("batch rejected with HTTP " + http + ", splitting", false);
                 } else if (dropped) {
-                    last_error_ = response.error_code("bad_request");
+                    last_error_ = response.error_code(response.status == 413 ? "payload_too_large"
+                                                                             : "bad_request");
                     if (!bad_event_warned_) {
                         bad_event_warned_ = true;
-                        note_locked("dropped an event the server refused with HTTP 400 (" +
+                        note_locked("dropped an event the server refused with HTTP " + http + " (" +
                                         last_error_ + "); counted in stats().dropped",
                                     true);
                     }

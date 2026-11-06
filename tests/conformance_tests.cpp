@@ -801,6 +801,30 @@ RS_TEST(single_event_400_is_dropped_and_the_queue_keeps_draining) {
     CHECK_EQ(client.stats().queued, 0);
 }
 
+RS_TEST(batch_413_is_split_like_a_400_and_never_retried_as_is) {
+    auto fake = std::make_shared<Fake>([](const Request& request) {
+        if (ends_with(request.url, "/track/batch")) {
+            for (const std::string& name : batch_event_names(request)) {
+                if (name == "huge") return reply(413, "{\"error\":\"payload_too_large\"}");
+            }
+            return reply(202, "{}");
+        }
+        return default_routes(request);
+    });
+    Config config = base_config();
+    config.flush_interval_seconds = 3600.0;
+    Client client(config, proxy(fake));
+    client.track("a");
+    client.track("huge");
+    client.track("b");
+    CHECK(client.flush_and_wait(3.0));
+    CHECK_EQ(client.stats().dropped, 1);
+    CHECK_EQ(client.stats().sent, 2);
+    CHECK_EQ(client.stats().last_error, std::string("payload_too_large"));
+    // The batch of three, then halves: never the same oversize batch twice.
+    CHECK(fake->count("/track/batch") <= 5);
+}
+
 RS_TEST(fifty_queued_events_send_without_waiting_for_the_timer) {
     auto fake = std::make_shared<Fake>();
     Config config = base_config();

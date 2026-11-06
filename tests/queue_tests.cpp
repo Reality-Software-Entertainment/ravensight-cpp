@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "ravensight/queue.hpp"
 #include "test_runner.hpp"
@@ -398,4 +399,64 @@ RS_TEST(retry_after_is_not_jittered) {
     queue.set_random_source([] { return 0.0; });
     queue.on_rate_limited(100.0, 30.0);
     CHECK_EQ(queue.seconds_until_next_attempt(100.0), 30.0);
+}
+
+// --- Automatic error captures stay behind gameplay -------------------------------
+
+namespace {
+
+Event make_capture(int index) {
+    Event event = make_event(index);
+    event.name = "error_" + std::to_string(index);
+    event.automatic_error = true;
+    return event;
+}
+
+std::vector<std::string> names(const Queue& queue) {
+    std::vector<std::string> out;
+    for (const Event& event : queue.events()) {
+        out.push_back(event.name);
+    }
+    return out;
+}
+
+} // namespace
+
+RS_TEST(gameplay_events_go_ahead_of_queued_captures) {
+    Queue queue;
+    queue.enqueue(make_event(1));
+    queue.enqueue(make_capture(1));
+    queue.enqueue(make_capture(2));
+    queue.enqueue(make_event(2));
+    const std::vector<std::string> expected{"event_1", "event_2", "error_1", "error_2"};
+    CHECK(names(queue) == expected);
+}
+
+RS_TEST(at_the_cap_a_capture_is_dropped_before_gameplay) {
+    Queue queue;
+    queue.set_max_queue_size(3);
+    queue.enqueue(make_event(1));
+    queue.enqueue(make_capture(1));
+    queue.enqueue(make_event(2));
+    CHECK_EQ(queue.enqueue(make_event(3)), 1); // the capture makes room
+    const std::vector<std::string> expected{"event_1", "event_2", "event_3"};
+    CHECK(names(queue) == expected);
+    // Only gameplay queued: a new capture is itself dropped.
+    CHECK_EQ(queue.enqueue(make_capture(2)), 1);
+    CHECK(names(queue) == expected);
+    CHECK_EQ(queue.stats().dropped, 2);
+}
+
+RS_TEST(accepting_a_batch_removes_its_events_even_after_an_insert_ahead) {
+    Queue queue;
+    queue.set_session("st", 10000.0);
+    queue.enqueue(make_event(1));
+    queue.enqueue(make_capture(1));
+    FlushPlan plan = queue.begin_flush(100.0, false);
+    REQUIRE(plan.batch.size() == std::size_t(2));
+    queue.enqueue(make_event(2)); // lands between the two in-flight events
+    CHECK_EQ(queue.on_batch_accepted(plan), 2);
+    queue.end_flush();
+    const std::vector<std::string> expected{"event_2"};
+    CHECK(names(queue) == expected);
 }
