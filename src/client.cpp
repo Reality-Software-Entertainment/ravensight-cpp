@@ -1461,6 +1461,10 @@ private:
     // --- The persisted queue ----------------------------------------------------
 
     void load_queue_locked() {
+        if (!queue_path_.empty()) {
+            // A write a crash cut short leaves its temporary file behind.
+            detail::remove_temp_files(queue_path_);
+        }
         std::string text;
         if (queue_path_.empty() || !detail::read_text_file(queue_path_, text)) {
             return;
@@ -1489,9 +1493,13 @@ private:
         if (queue_path_.empty() || persist_frozen_ || queue_.revision() == persisted_revision_) {
             return;
         }
-        const bool ok = queue_.is_empty()
-                            ? detail::remove_file(queue_path_)
-                            : detail::write_text_file(queue_path_, detail::write_queue_file(queue_.events()));
+        bool ok = false;
+        if (queue_.is_empty()) {
+            ok = detail::remove_file(queue_path_);
+            detail::remove_temp_files(queue_path_);
+        } else {
+            ok = detail::write_text_file(queue_path_, detail::write_queue_file(queue_.events()));
+        }
         persisted_revision_ = queue_.revision();
         if (!ok && !persist_warned_) {
             persist_warned_ = true;
@@ -1504,7 +1512,10 @@ private:
     // The opt-out or a device id reset: nothing tracked before may be sent
     // later, and the origin stamp must not outlive the queue.
     void forget_delivery_files_locked() {
-        if (!queue_path_.empty()) detail::remove_file(queue_path_);
+        if (!queue_path_.empty()) {
+            detail::remove_file(queue_path_);
+            detail::remove_temp_files(queue_path_);
+        }
         if (!attribution_path_.empty()) detail::remove_file(attribution_path_);
         attribution_sent_ = false;
         exposed_.clear();

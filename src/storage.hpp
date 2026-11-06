@@ -59,6 +59,11 @@ bool read_text_file(const std::string& path, std::string& out);
 /// parent directory first. False on any failure.
 bool write_text_file(const std::string& path, const std::string& text);
 
+/// Deletes every temporary file write_text_file may have left beside path
+/// (path + ".tmp.<pid>.<n>", from a process that died mid-write). Returns
+/// how many were removed.
+int remove_temp_files(const std::string& path);
+
 /// Deletes a file. True when it is gone afterwards (or never existed).
 bool remove_file(const std::string& path);
 

@@ -280,6 +280,40 @@ RS_TEST(rule_3_a_device_id_reset_deletes_the_queue_file) {
     CHECK(!fs::exists(queue_path(config)));
 }
 
+RS_TEST(leftover_temporary_queue_files_are_deleted_on_load_and_every_delete_path) {
+    const std::string dir = rstest::make_temp_dir();
+    Config config = wave_config(dir);
+    REQUIRE(detail::ensure_directory(dir));
+    const std::string stale = queue_path(config) + ".tmp.999.1";
+    auto plant = [&] { REQUIRE(detail::write_text_file(stale, "partial")); };
+    auto server = std::make_shared<Server>();
+    server->respond = [](const Request& request) {
+        return ends_with(request.url, "/track/batch") ? reply(0, "") : pass;
+    };
+    plant();
+    {
+        Client client(config, std::make_unique<Wire>(server));
+        CHECK(!fs::exists(stale)); // swept on load
+        plant();
+        client.reset_device_id();
+        CHECK(!fs::exists(stale)); // and on an id reset
+        plant();
+        client.set_tracking_enabled(false);
+        CHECK(!fs::exists(stale)); // and on an opt-out
+    }
+    // And when the queue empties.
+    config.consent = Consent::opt_out;
+    REQUIRE(set_tracking_enabled(config, true));
+    auto good = std::make_shared<Server>();
+    Client client(config, std::make_unique<Wire>(good));
+    client.track("a");
+    plant();
+    CHECK(client.flush_and_wait(3.0));
+    REQUIRE(wait_for([&] { return !fs::exists(queue_path(config)); }));
+    client.shutdown();
+    CHECK(!fs::exists(stale));
+}
+
 // --- Response table --------------------------------------------------------------
 
 RS_TEST(a_403_keeps_the_events_for_the_next_launch) {

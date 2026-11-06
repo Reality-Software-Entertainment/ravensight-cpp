@@ -33,6 +33,9 @@ device field contracts.
   file (a restored capture goes without its trail).
 * The README says where the queue file lives and how to keep the storage
   directory out of device backups.
+* A temporary queue file a crash left mid-write is deleted on load, an
+  empty queue, opt-out and id reset; a failed write or rename already
+  deleted its own.
   Capture records keep unix seconds; their events are queued in
   milliseconds like every other.
 * Event timestamps are unix milliseconds, set when the event is tracked.

@@ -313,6 +313,24 @@ bool write_text_file(const std::string& path, const std::string& text) {
     return true;
 }
 
+int remove_temp_files(const std::string& path) {
+    std::error_code error;
+    const fs::path target(path);
+    const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
+    const std::string prefix = target.filename().string() + ".tmp.";
+    int removed = 0;
+    for (fs::directory_iterator it(dir, error), end; !error && it != end; it.increment(error)) {
+        const std::string name = it->path().filename().string();
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            std::error_code ignored;
+            if (fs::remove(it->path(), ignored)) {
+                ++removed;
+            }
+        }
+    }
+    return removed;
+}
+
 bool remove_file(const std::string& path) {
     std::error_code error;
     fs::remove(fs::path(path), error);
