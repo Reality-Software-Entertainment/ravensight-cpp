@@ -236,6 +236,18 @@ bool CaptureLimiter::allow(const std::string& key, double now_seconds) {
     return true;
 }
 
+bool CaptureLimiter::has_room(double now_seconds) const {
+    if (captured_ >= captures_per_run) {
+        return false;
+    }
+    double tokens = tokens_;
+    if (tokens_at_ >= 0.0 && now_seconds > tokens_at_) {
+        tokens = std::min(static_cast<double>(captures_per_minute),
+                          tokens + (now_seconds - tokens_at_) * captures_per_minute / 60.0);
+    }
+    return tokens >= 1.0;
+}
+
 bool CaptureLimiter::take_trail() {
     if (trails_ >= trails_per_run) {
         return false;
@@ -250,20 +262,45 @@ void CaptureLimiter::reset() {
 
 // --- Trail ----------------------------------------------------------------------
 
-void Trail::add(long long ms_since_start, const std::string& level, const std::string& text) {
+std::string Trail::format_line(long long ms_since_start, const std::string& level,
+                               const std::string& text) {
     std::string flat = text;
     std::replace(flat.begin(), flat.end(), '\n', ' ');
     std::replace(flat.begin(), flat.end(), '\r', ' ');
     flat = trim(scrub_field(flat, trail_line_chars));
     if (flat.empty()) {
-        return;
+        return flat;
     }
     const std::string line =
         "+" + std::to_string(std::max(0LL, ms_since_start)) + " " + level + " " + flat;
-    lines_.push_back(cut_chars(line, trail_line_chars));
+    return cut_chars(line, trail_line_chars);
+}
+
+void Trail::push(std::string line) {
+    if (line.empty()) {
+        return;
+    }
+    lines_.push_back(std::move(line));
     while (lines_.size() > trail_lines) {
         lines_.pop_front();
     }
+}
+
+bool prepare_capture(const std::string& severity, const std::string& source,
+                     const std::string& type, const std::string& raw_message,
+                     const std::string& raw_stack, long long timestamp, PreparedCapture& out) {
+    out.message = trim(scrub_field(raw_message, error_message_chars));
+    if (out.message.empty()) {
+        return false;
+    }
+    out.severity = severity;
+    out.source = source;
+    out.type = scrub_field(type, error_type_chars);
+    out.stack = scrub_field(raw_stack, error_stack_chars);
+    out.timestamp = timestamp;
+    out.key = out.type + "|" + message_template(out.message) + "|" +
+              out.stack.substr(0, out.stack.find('\n'));
+    return true;
 }
 
 std::string Trail::text() const {
@@ -401,8 +438,15 @@ namespace {
 constexpr std::size_t max_path = 2048;
 
 std::mutex g_hook_mutex;
-std::terminate_handler g_previous_terminate = nullptr;
-bool g_terminate_installed = false;
+// std::set_terminate is per thread with the Microsoft runtime and process
+// wide elsewhere, so the install state follows the same scope.
+#if defined(_MSC_VER)
+#define RAVENSIGHT_TERMINATE_SCOPE thread_local
+#else
+#define RAVENSIGHT_TERMINATE_SCOPE
+#endif
+RAVENSIGHT_TERMINATE_SCOPE std::terminate_handler g_previous_terminate = nullptr;
+RAVENSIGHT_TERMINATE_SCOPE bool g_terminate_installed = false;
 std::atomic<bool> g_terminate_armed{false};
 std::atomic_flag g_in_terminate = ATOMIC_FLAG_INIT;
 char g_terminate_path[max_path] = {0};
@@ -418,8 +462,17 @@ bool copy_path(char* target, const std::string& path) {
     return true;
 }
 
+/// Writes the record readable by the player's account only (0600 on POSIX).
 void write_now(const char* path, const std::string& text) {
+#if defined(_WIN32)
     std::FILE* file = std::fopen(path, "wb");
+#else
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    std::FILE* file = fd >= 0 ? fdopen(fd, "wb") : nullptr;
+    if (file == nullptr && fd >= 0) {
+        close(fd);
+    }
+#endif
     if (file == nullptr) {
         return;
     }
@@ -436,6 +489,9 @@ void write_now(const char* path, const std::string& text) {
     if (g_terminate_armed.load()) {
         try {
             CrashRecord record = describe_current_exception();
+            // Scrubbed before it touches the disk, cut to the field limits.
+            record.type = scrub_field(record.type, error_type_chars);
+            record.message = scrub_field(record.message, error_message_chars);
             record.timestamp = static_cast<long long>(std::time(nullptr));
             write_now(g_terminate_path, serialize_crash(record));
             g_crash_written = 1;
@@ -480,6 +536,17 @@ void uninstall_terminate_handler() {
     }
 }
 
+void install_terminate_handler_on_this_thread() {
+#if defined(_MSC_VER)
+    std::lock_guard<std::mutex> lock(g_hook_mutex);
+    if (g_terminate_armed.load() && !g_terminate_installed) {
+        const std::terminate_handler previous = std::set_terminate(&on_terminate);
+        g_previous_terminate = previous == &on_terminate ? nullptr : previous;
+        g_terminate_installed = true;
+    }
+#endif
+}
+
 bool terminate_handler_installed() {
     std::lock_guard<std::mutex> lock(g_hook_mutex);
     return g_terminate_installed && g_terminate_armed.load() && std::get_terminate() == &on_terminate;
@@ -513,6 +580,27 @@ std::size_t write_digits(char* buf, long long value) {
     return n;
 }
 
+/// open, write and close only: all three are async-signal-safe.
+void write_signal_record(int number) {
+    if (!g_signals_armed || g_crash_written) {
+        return;
+    }
+    g_crash_written = 1;
+    const int fd = open(g_signal_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    char buf[64] = "signal ";
+    std::size_t n = 7;
+    n += write_digits(buf + n, number);
+    buf[n++] = ' ';
+    n += write_digits(buf + n, static_cast<long long>(time(nullptr)));
+    buf[n++] = '\n';
+    ssize_t ignored = write(fd, buf, n);
+    (void)ignored;
+    close(fd);
+}
+
 void on_signal(int number, siginfo_t* info, void* context) {
     int index = -1;
     for (int i = 0; i < g_signal_count; ++i) {
@@ -520,25 +608,15 @@ void on_signal(int number, siginfo_t* info, void* context) {
             index = i;
         }
     }
-    if (g_signals_armed && !g_crash_written) {
-        g_crash_written = 1;
-        // open, write and close only: all three are async-signal-safe.
-        const int fd = open(g_signal_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0) {
-            char buf[64] = "signal ";
-            std::size_t n = 7;
-            n += write_digits(buf + n, number);
-            buf[n++] = ' ';
-            n += write_digits(buf + n, static_cast<long long>(time(nullptr)));
-            buf[n++] = '\n';
-            ssize_t ignored = write(fd, buf, n);
-            (void)ignored;
-            close(fd);
-        }
-    }
     if (index < 0) {
         return;
     }
+    // A handler that was there before runs first and decides. A managed
+    // runtime (a scripting VM, a JIT, a wasm guard page) handles some of
+    // these signals as part of normal running and either returns having
+    // fixed things or jumps away: neither is a crash, so nothing is
+    // written. If it did not recover, the fault repeats or it falls through
+    // to the default action, which is where the record is written.
     struct sigaction& old = g_old_actions[index];
     if ((old.sa_flags & SA_SIGINFO) != 0 && old.sa_sigaction != nullptr) {
         old.sa_sigaction(number, info, context);
@@ -549,14 +627,40 @@ void on_signal(int number, siginfo_t* info, void* context) {
         old.sa_handler(number);
         return;
     }
-    // The default action: put it back and raise again, so the process dies
-    // exactly as it would have without the SDK.
+    // The default action: the process is about to die. Record it, then put
+    // the default back and raise again, so it dies exactly as it would have
+    // without the SDK.
+    write_signal_record(number);
     struct sigaction fallback;
     std::memset(&fallback, 0, sizeof(fallback));
     fallback.sa_handler = SIG_DFL;
     sigemptyset(&fallback.sa_mask);
     sigaction(number, &fallback, nullptr);
     raise(number);
+}
+
+/// A stack overflow faults on the guard page, where a handler has no stack
+/// to run on. Give the installing thread an alternate signal stack unless
+/// it already has one. Kept for the life of the process.
+void ensure_alternate_stack() {
+    stack_t current;
+    std::memset(&current, 0, sizeof(current));
+    if (sigaltstack(nullptr, &current) == 0 && (current.ss_flags & SS_DISABLE) == 0) {
+        return; // the game (or a runtime) already set one
+    }
+    const std::size_t size = std::max<std::size_t>(static_cast<std::size_t>(SIGSTKSZ), 64 * 1024);
+    void* memory = std::malloc(size);
+    if (memory == nullptr) {
+        return;
+    }
+    stack_t fresh;
+    std::memset(&fresh, 0, sizeof(fresh));
+    fresh.ss_sp = memory;
+    fresh.ss_size = size;
+    fresh.ss_flags = 0;
+    if (sigaltstack(&fresh, nullptr) != 0) {
+        std::free(memory);
+    }
 }
 
 } // namespace
@@ -574,7 +678,8 @@ bool install_signal_handlers(const std::string& path) {
     struct sigaction action;
     std::memset(&action, 0, sizeof(action));
     action.sa_sigaction = &on_signal;
-    action.sa_flags = SA_SIGINFO;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    ensure_alternate_stack();
     sigemptyset(&action.sa_mask);
     for (int i = 0; i < g_signal_count; ++i) {
         sigaction(g_signals[i], &action, &g_old_actions[i]);

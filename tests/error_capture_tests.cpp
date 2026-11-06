@@ -19,6 +19,7 @@
 #include "test_runner.hpp"
 
 #if !defined(_WIN32)
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -144,6 +145,11 @@ RS_TEST(limiter_caps_per_key_per_minute_and_per_run) {
     CHECK(limiter.allow("e", t + 10.0));
     CHECK(!limiter.allow("f", t + 10.0));
     CHECK_EQ(limiter.captured(), 7);
+    // has_room looks at the run cap and the bucket without counting.
+    CHECK(!limiter.has_room(t + 10.0));
+    CHECK(limiter.has_room(t + 20.0));
+    CHECK(limiter.has_room(t + 20.0));
+    CHECK_EQ(limiter.captured(), 7);
 
     // Thirty a run, however slowly they come.
     CaptureLimiter slow;
@@ -154,6 +160,7 @@ RS_TEST(limiter_caps_per_key_per_minute_and_per_run) {
         }
     }
     CHECK_EQ(allowed, captures_per_run);
+    CHECK(!slow.has_room(1e9));
 
     // Ten trails.
     int trails = 0;
@@ -270,10 +277,14 @@ RS_TEST(terminate_handler_records_the_exception_and_chains) {
     CHECK_EQ(WTERMSIG(status), SIGABRT);
     std::string text;
     REQUIRE(read_text_file(path, text));
+    struct stat info;
+    REQUIRE(stat(path.c_str(), &info) == 0);
+    CHECK_EQ(info.st_mode & 0777, static_cast<mode_t>(0600));
     CrashRecord record;
     REQUIRE(parse_crash(text, record));
     CHECK_EQ(record.type, std::string("std::runtime_error"));
-    CHECK_EQ(record.message, std::string("save failed for /Users/jacob/slot1.sav"));
+    // Scrubbed before it reached the disk.
+    CHECK_EQ(record.message, std::string("save failed for ~/slot1.sav"));
     CHECK(record.timestamp > 0);
     // The SIGABRT that followed did not write a second record.
     CHECK(!read_text_file(signal_path, text));
@@ -308,9 +319,11 @@ RS_TEST(signal_handler_writes_a_record_then_dies_as_before) {
 
 namespace {
 void game_own_handler(int) { _exit(42); }
+volatile std::sig_atomic_t g_runtime_handled = 0;
+void runtime_handler(int) { g_runtime_handled = 1; } // handles it and returns
 } // namespace
 
-RS_TEST(signal_handler_chains_to_the_game_handler) {
+RS_TEST(signal_handler_chains_to_the_game_handler_and_writes_nothing) {
     const std::string dir = rstest::make_temp_dir();
     const std::string path = join_path(dir, "crash_signal");
     const int status = in_child([&] {
@@ -320,8 +333,38 @@ RS_TEST(signal_handler_chains_to_the_game_handler) {
     });
     CHECK(WIFEXITED(status));
     CHECK_EQ(WEXITSTATUS(status), 42);
+    // The game's handler decided; the SDK did not call it a crash.
     std::string text;
-    CHECK(read_text_file(path, text));
+    CHECK(!read_text_file(path, text));
+}
+
+RS_TEST(a_signal_a_managed_runtime_handles_is_not_a_crash) {
+    const std::string dir = rstest::make_temp_dir();
+    const std::string path = join_path(dir, "crash_signal");
+    const int status = in_child([&] {
+        std::signal(SIGSEGV, &runtime_handler);
+        install_signal_handlers(path);
+        std::raise(SIGSEGV); // the runtime handles it and the game goes on
+        _exit(g_runtime_handled ? 7 : 1);
+    });
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 7);
+    std::string text;
+    CHECK(!read_text_file(path, text));
+}
+
+RS_TEST(signal_handlers_run_on_an_alternate_stack) {
+    const std::string dir = rstest::make_temp_dir();
+    const int status = in_child([&] {
+        install_signal_handlers(join_path(dir, "crash_signal"));
+        struct sigaction current;
+        sigaction(SIGSEGV, nullptr, &current);
+        stack_t stack;
+        sigaltstack(nullptr, &stack);
+        _exit((current.sa_flags & SA_ONSTACK) != 0 && (stack.ss_flags & SS_DISABLE) == 0 ? 0 : 1);
+    });
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 0);
 }
 
 #endif
