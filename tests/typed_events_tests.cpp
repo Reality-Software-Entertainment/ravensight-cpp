@@ -14,6 +14,7 @@
 #include "ravensight/client.hpp"
 #include "ravensight/version.hpp"
 #include "temp_dirs.hpp"
+#include "decoded.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -34,7 +35,8 @@ Response json_response(long status, const std::string& body) {
 
 class RecordingTransport : public Transport {
 public:
-    Response send(const Request& request) override {
+    Response send(const Request& raw) override {
+        const Request request = rstest::decoded(raw);
         std::lock_guard<std::mutex> lock(mutex_);
         requests_.push_back(request);
         if (ends_with(request.url, "/settings")) {
@@ -306,7 +308,7 @@ RS_TEST(session_request_names_the_sdk) {
             seen = true;
             const json::Value body = json::Value::parse(request.body);
             CHECK_EQ(body.get_string("sdk", ""), std::string("cpp/") + RAVENSIGHT_VERSION);
-            CHECK_EQ(std::string(RAVENSIGHT_VERSION), std::string("0.4.0"));
+            CHECK_EQ(std::string(RAVENSIGHT_VERSION), std::string("0.5.0"));
         }
     }
     CHECK(seen);

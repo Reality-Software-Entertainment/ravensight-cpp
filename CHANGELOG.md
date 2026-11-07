@@ -2,6 +2,57 @@
 
 All notable changes to this library are documented here.
 
+## [0.5.0] - 2026-11-06
+
+Implements the Ravensight delivery, ads and attribution, exposure and
+device field contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
+
+### Added
+
+* **Persisted queue**, on by default (`Config::persist_queue`): queue file
+  version 2, one per ingest key (`queue-<FNV-1a 64 hex>.json`), atomic
+  writes, 500 events, 89 days, each group with its session's `origin`
+  stored as received. Events tracked under an earlier session are sent
+  with that `origin`.
+* gzip of request bodies of 1,024 bytes or more when built with zlib.
+* Request signing when the session answer carries `signing`: HMAC-SHA256
+  over the uncompressed body, clock corrected by `serverTime`, secret in
+  memory only. Passes every vector in `delivery-vectors.json`.
+* `track_ad`, `track_ad_revenue`, `set_attribution`, `micros_from_decimal_string`,
+  `micros_from_double`, `map_ad_format`, and mediation adapters for AdMob,
+  AppLovin MAX, ironSource LevelPlay and TopOn that take callback values
+  (no mediation SDK is linked).
+* `Config::device` (`model`, `os_version`, `gpu`), sent on the session.
+
+### Changed
+
+* The queue file keeps `Event::automatic_error`, so captured errors stay
+  behind gameplay events, and are evicted first, after a restart too.
+* The queue rules agreed for every SDK: a capture in a batch in flight is
+  never evicted, and an error's `rs_trail` is never written to the queue
+  file (a restored capture goes without its trail).
+* The README says where the queue file lives and how to keep the storage
+  directory out of device backups.
+* A temporary queue file a crash left mid-write is deleted on load, an
+  empty queue, opt-out and id reset; a failed write or rename already
+  deleted its own.
+  Capture records keep unix seconds; their events are queued in
+  milliseconds like every other.
+* Event timestamps are unix milliseconds, set when the event is tracked.
+* Exposure tagging follows the exposure contract: no tag until the first
+  typed config read in a run, one `rs_exposure` event then, stopped
+  experiments untagged, and a well-formed `rs_exp_` value from the game is
+  kept (before, every event was tagged and game values were removed).
+* Response handling follows the delivery contract: `400` with `index` drops
+  that event, another non-split `400` drops the request's events, `413`
+  splits, `415` resends uncompressed, one session reopen per `401`, and a
+  `403` keeps the events on disk for the next launch.
+* Backoff jitter is a factor in [0.5, 1) (was plus or minus 20 percent);
+  `flush()` no longer cuts a `Retry-After` wait short.
+* The 8 KB event check counts an error event's message, stack and trail
+  one byte a character, as the server does (the anyKeyEventSize vectors).
 ## [0.4.0] - 2026-11-06
 
 ### Added

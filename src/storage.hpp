@@ -16,6 +16,9 @@ namespace detail {
 /// Lower case hex SHA-256 of data.
 std::string sha256_hex(const std::string& data);
 
+/// The 32 raw bytes of SHA-256 of data.
+std::string sha256_bytes(const std::string& data);
+
 /// Fills out with n bytes from the operating system's random source:
 /// BCryptGenRandom on Windows, getentropy where it exists, else
 /// /dev/urandom. Returns false when none of them worked.
@@ -55,6 +58,11 @@ bool read_text_file(const std::string& path, std::string& out);
 /// Writes a whole file through a temporary file and a rename, creating the
 /// parent directory first. False on any failure.
 bool write_text_file(const std::string& path, const std::string& text);
+
+/// Deletes every temporary file write_text_file may have left beside path
+/// (path + ".tmp.<pid>.<n>", from a process that died mid-write). Returns
+/// how many were removed.
+int remove_temp_files(const std::string& path);
 
 /// Deletes a file. True when it is gone afterwards (or never existed).
 bool remove_file(const std::string& path);

@@ -1,5 +1,6 @@
 #include "ravensight/client.hpp"
 #include "remote_config.hpp"
+#include "decoded.hpp"
 #include "test_runner.hpp"
 #include "temp_dirs.hpp"
 #include <atomic>
@@ -16,7 +17,8 @@ struct State { std::mutex mutex; std::condition_variable cv; std::vector<Request
 class Fake : public Transport {
  std::shared_ptr<State> state;
  public: explicit Fake(std::shared_ptr<State> s):state(s){}
- Response send(const Request& r) override {
+ Response send(const Request& raw) override {
+  const Request r = rstest::decoded(raw);
   std::unique_lock<std::mutex> lock(state->mutex); state->requests.push_back(r);
   if (r.url.find("/ingest/config?") != std::string::npos) { ++state->config_calls; state->cv.notify_all(); state->cv.wait(lock,[&]{return !state->block || state->release;}); return {state->status, snapshot(),""}; }
   if (r.url.find("/settings") != std::string::npos) return {200,"{\"trackingEnabled\":true}",""};
@@ -51,7 +53,7 @@ RS_TEST(config_consent_typed_values_etag_and_exposure_time) {
  CHECK_EQ(client.get_config_number("speed",7),2.0); CHECK_EQ(client.get_config_number("enabled",7),7.0);
  CHECK(client.get_config_bool("enabled",false)); CHECK_EQ(client.get_config_string("speed","fallback"),std::string("fallback"));
  CHECK(client.get_config_json("layout",{}).is_object());
- client.track("after",{{"rs_exp_fake","spoof"},{"exact",9007199254740993LL}}); client.flush_and_wait();
+ client.track("after",{{"rs_exp_fake","spoof"},{"rs_exp_Bad","x"},{"rs_exp_difficulty","Bad Value"},{"exact",9007199254740993LL}}); client.flush_and_wait();
  { std::lock_guard<std::mutex> lock(state->mutex); state->status=304; }
  client.fetch_config(); REQUIRE(wait([&]{return ready.load()==2;}));
  client.shutdown();
@@ -60,7 +62,7 @@ RS_TEST(config_consent_typed_values_etag_and_exposure_time) {
   if(r.url.find("/ingest/config?")!=std::string::npos){encoded=r.url.find("deviceId=dev%20%2Fone")!=std::string::npos;for(const auto& h:r.headers)if(h.first=="If-None-Match")etag=true;}
   if(r.body.find("9007199254740993")!=std::string::npos) exact=true;
   auto body=json::Value::parse(r.body);auto events=body.find("events");if(!events)continue;
-  for(const auto& e:events->items()){auto data=e.find("data");if(!data)continue;if(e.get_string("event","")=="before" || e.get_string("name","")=="before")before=!data->find("rs_exp_difficulty");if(e.get_string("event","")=="after" || e.get_string("name","")=="after")after=data->get_string("rs_exp_difficulty","")=="easy"&&!data->find("rs_exp_fake");}
+  for(const auto& e:events->items()){auto data=e.find("data");if(!data)continue;if(e.get_string("event","")=="before" || e.get_string("name","")=="before")before=!data->find("rs_exp_difficulty");if(e.get_string("event","")=="after" || e.get_string("name","")=="after")after=data->get_string("rs_exp_difficulty","")=="easy"&&data->get_string("rs_exp_fake","")=="spoof"&&!data->find("rs_exp_Bad");}
  }
  CHECK(encoded); CHECK(etag); CHECK(before); CHECK(after); CHECK(exact);
 }

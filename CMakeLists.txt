@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ravensight
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "Official C++ SDK for Ravensight player analytics"
     HOMEPAGE_URL "https://ravensight.io"
     LANGUAGES CXX)
@@ -21,6 +21,7 @@ add_library(ravensight
     src/client.cpp
     src/curl_transport.cpp
     src/error_capture.cpp
+    src/delivery.cpp
     src/health.cpp
     src/json.cpp
     src/queue.cpp
@@ -47,6 +48,13 @@ find_package(Threads REQUIRED)
 target_link_libraries(ravensight
     PRIVATE CURL::libcurl
     PUBLIC Threads::Threads)
+# zlib compresses request bodies of 1 KB or more. libcurl already depends on
+# it nearly everywhere; without it bodies are sent uncompressed.
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    target_link_libraries(ravensight PRIVATE ZLIB::ZLIB)
+    target_compile_definitions(ravensight PRIVATE RAVENSIGHT_HAVE_ZLIB=1)
+endif()
 if(WIN32)
     # BCryptGenRandom, the device id random source on Windows.
     target_link_libraries(ravensight PRIVATE bcrypt)
@@ -74,11 +82,17 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/conformance_tests.cpp
         tests/typed_events_tests.cpp
         tests/error_capture_tests.cpp
-        tests/error_capture_client_tests.cpp)
+        tests/error_capture_client_tests.cpp
+        tests/delivery_tests.cpp
+        tests/wave_client_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
     target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_compile_definitions(ravensight_tests PRIVATE
-        RAVENSIGHT_TEST_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures")
+        RAVENSIGHT_TEST_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures"
+        RAVENSIGHT_VECTORS_FILE="${PROJECT_SOURCE_DIR}/tests/fixtures/delivery-vectors.json")
+    if(ZLIB_FOUND)
+        target_compile_definitions(ravensight_tests PRIVATE RAVENSIGHT_HAVE_ZLIB=1)
+    endif()
     if(MSVC)
         target_compile_options(ravensight_tests PRIVATE /W4)
     else()

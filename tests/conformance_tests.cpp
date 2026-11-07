@@ -23,6 +23,7 @@
 #include "ravensight/client.hpp"
 #include "storage.hpp"
 #include "temp_dirs.hpp"
+#include "decoded.hpp"
 #include "test_runner.hpp"
 
 using namespace ravensight;
@@ -108,7 +109,8 @@ public:
 
     explicit Fake(Responder responder = &default_routes) : responder_(std::move(responder)) {}
 
-    Response send(const Request& request) override {
+    Response send(const Request& raw) override {
+        const Request request = rstest::decoded(raw);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             requests_.push_back(request);
@@ -781,8 +783,12 @@ RS_TEST(batch_503_honors_retry_after) {
 RS_TEST(single_event_400_is_dropped_and_the_queue_keeps_draining) {
     auto fake = std::make_shared<Fake>([](const Request& request) {
         if (ends_with(request.url, "/track/batch")) {
-            for (const std::string& name : batch_event_names(request)) {
-                if (name == "poison") return reply(400, "{\"error\":\"invalid_event\"}");
+            // The server names the refused event by its index in the batch.
+            const std::vector<std::string> names = batch_event_names(request);
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                if (names[i] == "poison") {
+                    return reply(400, "{\"error\":\"invalid_event\",\"index\":" + std::to_string(i) + "}");
+                }
             }
             return reply(202, "{}");
         }

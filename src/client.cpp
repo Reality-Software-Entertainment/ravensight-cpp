@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "error_capture.hpp"
+#include "delivery.hpp"
 #include "health.hpp"
 #include "ravensight/error_capture.hpp"
 #include "remote_config.hpp"
@@ -118,6 +119,44 @@ double now_unix_seconds() {
     return std::chrono::duration<double>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+long long now_unix_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+bool is_lower_alnum(char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'); }
+
+/// ^[a-z][a-z0-9_]{0,63}$, an experiment key.
+bool valid_experiment_key(const std::string& key) {
+    if (key.empty() || key.size() > 64 || !(key[0] >= 'a' && key[0] <= 'z')) return false;
+    for (char ch : key) if (!is_lower_alnum(ch) && ch != '_') return false;
+    return true;
+}
+
+/// ^[a-z][a-z0-9_-]{0,39}$, a variant name.
+bool valid_variant(const std::string& variant) {
+    if (variant.empty() || variant.size() > 40 || !(variant[0] >= 'a' && variant[0] <= 'z')) return false;
+    for (char ch : variant) if (!is_lower_alnum(ch) && ch != '_' && ch != '-') return false;
+    return true;
+}
+
+bool all_digits(const std::string& text, std::size_t max) {
+    if (text.empty() || text.size() > max) return false;
+    for (char ch : text) if (ch < '0' || ch > '9') return false;
+    return true;
+}
+
+bool in_list(const std::string& value, const std::array<std::string_view, 6>& list) {
+    for (std::string_view item : list) if (value == item) return true;
+    return false;
+}
+
+bool in_list(const std::string& value, const std::array<std::string_view, 4>& list) {
+    for (std::string_view item : list) if (value == item) return true;
+    return false;
 }
 
 bool starts_with(const std::string& text, const std::string& prefix) {
@@ -425,6 +464,54 @@ const char* to_string(Status status) {
     return "";
 }
 
+std::string micros_from_decimal_string(const std::string& text) {
+    return detail::micros_from_decimal_string(text);
+}
+
+std::string micros_from_double(double major_units) { return detail::micros_from_double(major_units); }
+
+std::string map_ad_format(const std::string& label) { return detail::map_ad_format(label); }
+
+namespace {
+AdEvent shown_ad(std::string network, std::string format, std::string placement,
+                 std::string micros, std::string currency) {
+    AdEvent ad;
+    ad.network = detail::trim(network);
+    ad.format = std::move(format);
+    ad.result = "shown";
+    ad.placement = detail::trim(placement);
+    ad.revenue_micros = std::move(micros);
+    for (char& ch : currency) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    ad.currency = detail::trim(currency);
+    return ad;
+}
+} // namespace
+
+AdEvent ad_from_admob(long long value_micros, const std::string& currency_code,
+                      const std::string& ad_source_name, const std::string& format,
+                      const std::string& placement) {
+    const std::string network = detail::trim(ad_source_name).empty() ? "admob" : ad_source_name;
+    return shown_ad(network, map_ad_format(format), placement,
+                    value_micros >= 0 ? std::to_string(value_micros) : std::string(), currency_code);
+}
+
+AdEvent ad_from_applovin_max(double revenue, const std::string& network_name,
+                             const std::string& format_label, const std::string& placement) {
+    return shown_ad(network_name, map_ad_format(format_label), placement, micros_from_double(revenue), "USD");
+}
+
+AdEvent ad_from_ironsource(double revenue, const std::string& ad_network, const std::string& ad_unit,
+                           const std::string& placement) {
+    return shown_ad(ad_network, map_ad_format(ad_unit), placement, micros_from_double(revenue), "USD");
+}
+
+AdEvent ad_from_topon(double publisher_revenue, const std::string& currency,
+                      const std::string& network_name, const std::string& ad_type,
+                      const std::string& placement) {
+    return shown_ad(network_name, map_ad_format(ad_type), placement,
+                    micros_from_double(publisher_revenue), currency);
+}
+
 std::string generate_device_id() {
     unsigned char bytes[16];
     if (!detail::os_random_bytes(bytes, sizeof(bytes))) {
@@ -620,6 +707,15 @@ public:
                 // deleted) only once capture installs.
                 load_crash_records();
             }
+            if (config_.persist_queue) {
+                queue_path_ = detail::join_path(dir, detail::queue_file_name(detail::trim(config_.ingest_key)));
+            }
+            attribution_path_ = detail::join_path(dir, "attribution_sent");
+        }
+        device_ = build_device_json(config_.device);
+        if (opted_out_) {
+            // The player said no: nothing tracked before may be sent later.
+            forget_delivery_files_locked();
         }
 
         apply_local_state_locked();
@@ -686,9 +782,20 @@ public:
         Event event;
         event.name = event_name;
         EventData clean;
-        for (const auto& member : data) if (member.first.rfind("rs_exp_", 0) != 0) clean.push_back(member);
+        for (const auto& member : data) {
+            // A well-formed rs_exp_ tag from the game is the game's to keep;
+            // a malformed one is removed (and the SDK's own, if any, used).
+            if (member.first.rfind("rs_exp_", 0) == 0) {
+                const std::string value = member.second.to_json();
+                const bool ok = valid_experiment_key(member.first.substr(7)) && value.size() >= 2 &&
+                                value.front() == '"' && value.back() == '"' &&
+                                valid_variant(value.substr(1, value.size() - 2));
+                if (!ok) continue;
+            }
+            clean.push_back(member);
+        }
         event.data_json = write_fields(clean);
-        event.timestamp = static_cast<long long>(now_unix_seconds());
+        event.timestamp = now_unix_ms();
 
         // The trail line is scrubbed before taking the lock.
         std::string trail_line;
@@ -905,15 +1012,51 @@ public:
         cv_.notify_all();
     }
 
-    json::Value config_value(const std::string& key) const {
+    // A typed read: the value, and exposure for every assigned experiment
+    // not yet exposed this run (one rs_exposure event for them).
+    json::Value config_value(const std::string& key) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!queue_.is_active()) return {};
+        expose_locked();
         const auto* value = remote_values_.find(key);
         return value ? *value : json::Value{};
     }
 
+    void expose_locked() {
+        std::vector<std::pair<std::string, std::string>> fresh;
+        for (const auto& experiment : remote_experiments_.items()) {
+            const std::string key = experiment.get_string("key", "");
+            const std::string variant = experiment.get_string("variant", "");
+            if (!valid_experiment_key(key) || !valid_variant(variant)) continue;
+            bool known = false;
+            for (const auto& exposed : exposed_) known = known || exposed.first == key;
+            if (!known) fresh.emplace_back(key, variant);
+        }
+        if (fresh.empty() || shutdown_requested_) return;
+        exposed_.insert(exposed_.end(), fresh.begin(), fresh.end());
+        Event event;
+        event.name = "rs_exposure";
+        event.timestamp = now_unix_ms();
+        enqueue_locked(std::move(event));
+    }
+
+    // A fetch replaced the assignments: a stopped experiment is no longer
+    // tagged, and a changed variant is tagged as now assigned.
+    void prune_exposed_locked() {
+        std::vector<std::pair<std::string, std::string>> kept;
+        for (const auto& exposed : exposed_) {
+            for (const auto& experiment : remote_experiments_.items()) {
+                if (experiment.get_string("key", "") == exposed.first) {
+                    kept.emplace_back(exposed.first, experiment.get_string("variant", ""));
+                }
+            }
+        }
+        exposed_.swap(kept);
+    }
+
     void clear_config_locked() {
         remote_values_ = {}; remote_experiments_ = {}; remote_etag_.clear();
+        exposed_.clear();
         config_pending_ = false; ++identity_generation_;
     }
 
@@ -936,6 +1079,7 @@ public:
                 detail::ConfigSnapshot cached;
                 if (detail::read_config_cache(cache_path, cached)) {
                     remote_values_ = cached.values; remote_experiments_ = cached.experiments; remote_etag_ = cached.etag;
+                    prune_exposed_locked();
                 }
             }
             etag = remote_etag_;
@@ -954,6 +1098,7 @@ public:
             config_pending_ = false;
             if (fresh) {
                 remote_values_ = parsed.values; remote_experiments_ = parsed.experiments; remote_etag_ = parsed.etag;
+                prune_exposed_locked();
                 if (!cache_path.empty()) detail::write_text_file(cache_path, response.body);
             }
             ok = fresh || (response.status == 304 && !etag.empty());
@@ -1010,6 +1155,9 @@ public:
         const bool was_active = queue_.is_active();
         opted_out_ = !enabled;
         apply_local_state_locked();
+        if (!enabled) {
+            forget_delivery_files_locked();
+        }
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
@@ -1048,6 +1196,7 @@ public:
             clear_config_locked();
             reset_capture_run_locked();
             discard_crash_records_locked();
+            forget_delivery_files_locked();
             schedule_settings_check_locked();
             return device_id_;
         }
@@ -1071,6 +1220,7 @@ public:
         reset_capture_run_locked();
         // A crash saved under the old id is never sent.
         discard_crash_records_locked();
+        forget_delivery_files_locked();
         schedule_settings_check_locked();
         return device_id_;
     }
@@ -1137,6 +1287,76 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+    }
+
+    // --- Ads and attribution ------------------------------------------------
+
+    bool track_ad(const AdEvent& ad) {
+        const std::string network = detail::trim(ad.network);
+        const std::string placement = detail::trim(ad.placement);
+        std::string currency = detail::trim(ad.currency);
+        for (char& ch : currency) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        const bool has_revenue = !ad.revenue_micros.empty();
+        bool currency_ok = currency.size() == 3;
+        for (char ch : currency) currency_ok = currency_ok && ch >= 'A' && ch <= 'Z';
+        if (network.empty() || detail::utf16_units(network) > 64 || !in_list(ad.format, ad_formats) ||
+            !in_list(ad.result, ad_results) || detail::utf16_units(placement) > 100 ||
+            (has_revenue && (!all_digits(ad.revenue_micros, 18) || !currency_ok || ad.result != "shown"))) {
+            note("ad event refused locally: check network, format, result, and that revenue comes "
+                 "with a currency on a shown result");
+            return false;
+        }
+        EventData data{{"rs_kind", "ad"},
+                       {"rs_ad_network", network},
+                       {"rs_ad_format", ad.format},
+                       {"rs_ad_result", ad.result}};
+        if (!placement.empty()) data.emplace_back("rs_ad_placement", placement);
+        if (has_revenue) {
+            data.emplace_back("rs_revenue_micros", ad.revenue_micros);
+            data.emplace_back("rs_currency", currency);
+        }
+        return track("rs_ad", data);
+    }
+
+    bool set_attribution(const Attribution& attribution) {
+        const std::string source = detail::trim(attribution.source);
+        if (source.empty() || detail::utf16_units(source) > 64) {
+            note("attribution refused locally: source must be 1 to 64 characters");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::string flag;
+            if (attribution_sent_ ||
+                (!attribution_path_.empty() && detail::read_text_file(attribution_path_, flag))) {
+                attribution_sent_ = true;
+                return false;
+            }
+        }
+        EventData data{{"rs_kind", "attribution"}, {"rs_attr_source", source}};
+        const std::pair<const char*, const std::string*> fields[] = {
+            {"rs_attr_network", &attribution.network}, {"rs_campaign", &attribution.campaign},
+            {"rs_adset", &attribution.adset}, {"rs_creative", &attribution.creative}};
+        for (const auto& field : fields) {
+            const std::string value = detail::trim(*field.second);
+            const std::size_t max = std::string(field.first) == "rs_attr_network" ? 100 : 200;
+            if (value.empty()) continue;
+            if (detail::utf16_units(value) > max) {
+                note(std::string("attribution refused locally: ") + field.first + " is too long");
+                return false;
+            }
+            data.emplace_back(field.first, value);
+        }
+        if (attribution.touch_time_ms > 0) data.emplace_back("rs_touch_time", attribution.touch_time_ms);
+        if (!track("rs_attribution", data)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        attribution_sent_ = true;
+        if (!attribution_path_.empty()) {
+            detail::write_text_file(attribution_path_, "sent\n");
+        }
+        return true;
     }
 
 private:
@@ -1222,14 +1442,99 @@ private:
         const auto path = config_cache_path_locked();
         if (!path.empty() && detail::read_config_cache(path, cached)) {
             remote_values_ = cached.values; remote_experiments_ = cached.experiments; remote_etag_ = cached.etag;
+            prune_exposed_locked();
+        }
+        if (!delivery_loaded_ && queue_.is_active()) {
+            delivery_loaded_ = true;
+            load_queue_locked();
+            loaded_through_sequence_ = queue_.last_sequence();
         }
         if (config_.track_lifecycle_events && !started_queued_ && queue_.is_active()) {
             started_queued_ = true;
             Event event;
             event.name = "game_started";
-            event.timestamp = static_cast<long long>(now_unix_seconds());
+            event.timestamp = now_unix_ms();
             enqueue_locked(std::move(event));
         }
+    }
+
+    // --- The persisted queue ----------------------------------------------------
+
+    void load_queue_locked() {
+        if (!queue_path_.empty()) {
+            // A write a crash cut short leaves its temporary file behind.
+            detail::remove_temp_files(queue_path_);
+        }
+        std::string text;
+        if (queue_path_.empty() || !detail::read_text_file(queue_path_, text)) {
+            return;
+        }
+        detail::LoadedQueue loaded = detail::read_queue_file(text, now_unix_ms(), queue_.max_queue_size());
+        for (Event& event : loaded.events) {
+            queue_.enqueue(std::move(event));
+        }
+        queue_.count_dropped(loaded.too_old + loaded.over_cap);
+        if (loaded.too_old + loaded.over_cap > 0) {
+            note_locked("dropped " + std::to_string(loaded.too_old + loaded.over_cap) +
+                            " saved event(s) older than 89 days or past the queue cap",
+                        false);
+        } else {
+            persisted_revision_ = queue_.revision();
+        }
+        if (!loaded.events.empty()) {
+            note_locked("loaded " + std::to_string(loaded.events.size()) + " unsent event(s)", false);
+        }
+    }
+
+    // Writes the queue file when the queue changed since the last write: the
+    // whole queue, atomically, or no file when it is empty. Never after the
+    // run was stopped (the events are kept for the next launch).
+    void persist_locked() {
+        if (queue_path_.empty() || persist_frozen_ || queue_.revision() == persisted_revision_) {
+            return;
+        }
+        bool ok = false;
+        if (queue_.is_empty()) {
+            ok = detail::remove_file(queue_path_);
+            detail::remove_temp_files(queue_path_);
+        } else {
+            ok = detail::write_text_file(queue_path_, detail::write_queue_file(queue_.events()));
+        }
+        persisted_revision_ = queue_.revision();
+        if (!ok && !persist_warned_) {
+            persist_warned_ = true;
+            note_locked("could not write the queue file " + queue_path_ +
+                            "; unsent events are kept in memory only",
+                        true);
+        }
+    }
+
+    // The opt-out or a device id reset: nothing tracked before may be sent
+    // later, and the origin stamp must not outlive the queue.
+    void forget_delivery_files_locked() {
+        if (!queue_path_.empty()) {
+            detail::remove_file(queue_path_);
+            detail::remove_temp_files(queue_path_);
+        }
+        if (!attribution_path_.empty()) detail::remove_file(attribution_path_);
+        attribution_sent_ = false;
+        exposed_.clear();
+        persisted_revision_ = queue_.revision();
+    }
+
+    static std::string build_device_json(const DeviceInfo& device) {
+        json::ObjectWriter writer;
+        bool any = false;
+        const std::pair<const char*, const std::string*> fields[] = {
+            {"model", &device.model}, {"osVersion", &device.os_version}, {"gpu", &device.gpu}};
+        for (const auto& field : fields) {
+            const std::string value = detail::clean_device_field(*field.second);
+            if (!value.empty()) {
+                writer.add(field.first, value);
+                any = true;
+            }
+        }
+        return any ? writer.str() : std::string();
     }
 
     void persist_device_id_locked() {
@@ -1282,9 +1587,17 @@ private:
     // it is dropped and never sent.
     bool enqueue_locked(Event event) {
         // Append without reparsing: preserve exact integer payloads and the
-        // assignment at enqueue time, including across retry attempts.
-        for (const auto& experiment : remote_experiments_.items()) {
-            append_member(event.data_json, json::escape_string("rs_exp_" + experiment.get_string("key", "")) + ":" + json::escape_string(experiment.get_string("variant", "")));
+        // assignment at enqueue time, including across retry attempts. Only
+        // experiments exposed this run are tagged, and never over a tag the
+        // game set itself.
+        for (const auto& exposed : exposed_) {
+            const std::string key = json::escape_string("rs_exp_" + exposed.first);
+            if (event.data_json.find(key + ":") == std::string::npos) {
+                append_member(event.data_json, key + ":" + json::escape_string(exposed.second));
+            }
+        }
+        if (event.origin_json.empty()) {
+            event.origin_json = current_origin_;
         }
         if (!playtest_tags_.empty()) {
             append_member(event.data_json, playtest_tags_);
@@ -1294,7 +1607,7 @@ private:
                       "\"rs_event_id\":" +
                           json::escape_string(make_event_id(device_id_, start_unix_, event_nonce_,
                                                             event_counter_)));
-        if (event.data_json.size() > limits::max_event_bytes) {
+        if (detail::counted_event_bytes(event.data_json) > limits::max_event_bytes) {
             ++too_large_dropped_;
             last_error_ = "event_too_large";
             if (!too_large_warned_) {
@@ -1306,9 +1619,15 @@ private:
             }
             return false;
         }
+        const bool was_clean = queue_.revision() == persisted_revision_;
         const int dropped = queue_.enqueue(std::move(event));
         if (dropped > 0) {
             note_locked("queue full, dropped " + std::to_string(dropped) + " oldest event(s)", false);
+        }
+        if (was_clean && !queue_path_.empty()) {
+            // Ask the worker to write the queue file within a second.
+            ++persist_kicks_;
+            cv_.notify_all();
         }
         return true;
     }
@@ -1463,7 +1782,8 @@ private:
         Event event;
         event.name = "error";
         event.data_json = write_fields(data);
-        event.timestamp = timestamp > 0 ? timestamp : static_cast<long long>(now_unix_seconds());
+        // Capture records keep unix seconds; queued events are milliseconds.
+        event.timestamp = timestamp > 0 ? timestamp * 1000 : now_unix_ms();
         event.automatic_error = true;
         if (!capture_known_) {
             // A boot error: held until the game's switch is known.
@@ -1513,6 +1833,9 @@ private:
             return;
         }
         clear_config_locked();
+        // The events stay in the queue file for the next launch.
+        persist_locked();
+        persist_frozen_ = true;
         stopped_ = true;
         stop_reason_ = reason;
         last_error_ = error_code.empty() ? to_string(reason) : error_code;
@@ -1684,6 +2007,9 @@ private:
             if (!distribution_.empty()) {
                 body.add("distribution", distribution_);
             }
+            if (!device_.empty()) {
+                body.add_raw("device", device_);
+            }
 
             Request request = make_request("POST", "/session", true);
             request.body = body.str();
@@ -1723,6 +2049,28 @@ private:
                 if (join_token_ == join_token) {
                     join_token_.clear();
                 }
+                // The session's origin, kept exactly as received: events
+                // tracked under it carry it, so a later launch can send them
+                // as this session's.
+                const json::Value* origin = parsed.find("origin");
+                current_origin_ = origin != nullptr && origin->is_object() ? origin->dump() : "";
+                current_session_id_ = detail::origin_session(current_origin_);
+                if (!current_origin_.empty()) {
+                    queue_.stamp_origin(loaded_through_sequence_, current_origin_);
+                }
+                // A public key's signing secret: memory only, never saved.
+                signing_secret_.clear();
+                clock_offset_seconds_ = 0;
+                const json::Value* signing = parsed.find("signing");
+                if (signing != nullptr && signing->is_object() &&
+                    signing->get_string("algorithm", "") == "HMAC-SHA256") {
+                    signing_secret_ = signing->get_string("secret", "");
+                    double server_time = 0;
+                    if (signing->get_number("serverTime", server_time) && server_time > 0) {
+                        clock_offset_seconds_ =
+                            static_cast<long long>(std::llround(server_time - now_unix_seconds()));
+                    }
+                }
                 transient_ = Status::ok;
                 note_locked("session ready", false);
                 if (!config_pending_ && !shutdown_requested_) {
@@ -1756,7 +2104,10 @@ private:
         return false;
     }
 
-    static std::string build_batch_body(const std::vector<Event>& batch) {
+    /// The batch body. An event tracked under an earlier session than the
+    /// current one carries that session's origin, copied verbatim.
+    static std::string build_batch_body(const std::vector<Event>& batch,
+                                        const std::string& current_session_id) {
         std::string body = "{\"events\":[";
         for (std::size_t i = 0; i < batch.size(); ++i) {
             if (i > 0) {
@@ -1768,6 +2119,11 @@ private:
             body += batch[i].data_json;
             body += ",\"timestamp\":";
             body += std::to_string(batch[i].timestamp);
+            if (!batch[i].origin_json.empty() &&
+                detail::origin_session(batch[i].origin_json) != current_session_id) {
+                body += ",\"origin\":";
+                body += batch[i].origin_json;
+            }
             body.push_back('}');
         }
         body += "]}";
@@ -1809,17 +2165,50 @@ private:
                 return;
             }
 
+            std::string session_id;
+            std::string secret;
+            long long offset = 0;
+            bool plain_only = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                session_id = current_session_id_;
+                secret = signing_secret_;
+                offset = clock_offset_seconds_;
+                plain_only = gzip_refused_;
+            }
+            const std::string body = build_batch_body(plan.batch, session_id);
             Request request = make_request("POST", "/track/batch", false);
-            request.body = build_batch_body(plan.batch);
             request.with_header("Content-Type", "application/json");
             request.with_header("X-Session-Token", token);
+            if (!secret.empty()) {
+                // Over the exact bytes, before compression.
+                const long long timestamp =
+                    static_cast<long long>(std::floor(now_unix_seconds())) + offset;
+                request.with_header("X-Ravensight-Timestamp", std::to_string(timestamp));
+                request.with_header("X-Ravensight-Signature",
+                                    detail::signature_header(secret, timestamp, body));
+            }
+            bool compressed = false;
+            if (!plain_only && body.size() >= detail::gzip_threshold_bytes) {
+                std::string gzipped = detail::gzip_compress(body);
+                if (!gzipped.empty()) {
+                    request.body = std::move(gzipped);
+                    request.with_header("Content-Encoding", "gzip");
+                    compressed = true;
+                }
+            }
+            if (!compressed) {
+                request.body = body;
+            }
 
             const Response response = transport_->send(request);
             const std::size_t batch_size = plan.batch.size();
 
-            if (response.status == 202) {
+            if (response.status >= 200 && response.status < 300) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 queue_.on_batch_accepted(plan);
+                // The removal is on disk before anything else happens.
+                persist_locked();
                 queue_.end_flush();
                 transient_ = Status::ok;
                 reauth_attempts = 0;
@@ -1827,19 +2216,22 @@ private:
             }
 
             if (response.status == 401) {
-                // Session expired or revoked. The batch stays queued and is
-                // re-sent as soon as a fresh session is issued, at most twice
-                // in a row; after that, ordinary backoff.
+                // Session expired or revoked, or a signature refused. The
+                // batch stays queued and is re-sent, with the same event ids,
+                // under a fresh session opened once; a second 401 in a row
+                // waits for the backoff.
                 std::lock_guard<std::mutex> lock(mutex_);
                 queue_.on_unauthorized();
                 queue_.end_flush();
-                if (++reauth_attempts > 2) {
+                if (++reauth_attempts > 1) {
                     queue_.schedule_backoff(now_unix_seconds());
                     record_transient_locked(Status::session_failed, response);
                     note_locked("session refused twice in a row, backing off", false);
                     return;
                 }
-                note_locked("session expired, re-authenticating", false);
+                note_locked("session refused (" + response.error_code("unauthorized") +
+                                "), opening a new one",
+                            false);
                 continue;
             }
 
@@ -1848,27 +2240,48 @@ private:
                     std::lock_guard<std::mutex> lock(mutex_);
                     queue_.end_flush();
                 }
+                // The events stay in the queue file for the next launch.
                 handle_refusal(response);
                 return;
             }
 
-            if (response.status == 400 || response.status == 413) {
-                // A 413 (body too large) is handled exactly like a 400:
-                // split, then drop the one event that cannot go, never
-                // retry it as is.
-                const std::string http = std::to_string(response.status);
+            if (response.status == 415 && compressed) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                const bool dropped = queue_.on_bad_request(plan);
                 queue_.end_flush();
-                if (batch_size > 1) {
-                    note_locked("batch rejected with HTTP " + http + ", splitting", false);
-                } else if (dropped) {
-                    last_error_ = response.error_code(response.status == 413 ? "payload_too_large"
-                                                                             : "bad_request");
+                gzip_refused_ = true;
+                note_locked("compressed body refused (HTTP 415), sending uncompressed", false);
+                continue;
+            }
+
+            if (response.status == 400 || response.status == 413 || response.status == 415) {
+                const json::Value parsed = response.parse_json();
+                const std::string code = parsed.get_string("error", "bad_request");
+                double index = -1;
+                const bool indexed = response.status == 400 && parsed.get_number("index", index) &&
+                                     index >= 0 && index < static_cast<double>(batch_size);
+                const bool too_large = response.status == 413 || code == "batch_too_large";
+                std::lock_guard<std::mutex> lock(mutex_);
+                int dropped = 0;
+                if (indexed) {
+                    dropped = queue_.drop_indexed(plan, static_cast<std::size_t>(index)) ? 1 : 0;
+                } else if (too_large && batch_size > 1) {
+                    queue_.on_bad_request(batch_size);
+                    note_locked("batch too large (HTTP " + std::to_string(response.status) +
+                                    "), splitting",
+                                false);
+                } else {
+                    dropped = queue_.drop_batch(plan);
+                }
+                persist_locked();
+                queue_.end_flush();
+                if (dropped > 0) {
+                    last_error_ = code;
                     if (!bad_event_warned_) {
                         bad_event_warned_ = true;
-                        note_locked("dropped an event the server refused with HTTP " + http + " (" +
-                                        last_error_ + "); counted in stats().dropped",
+                        note_locked("dropped " + std::to_string(dropped) +
+                                        " event(s) the server refused with HTTP " +
+                                        std::to_string(response.status) + " (" + code +
+                                        "); counted in stats().dropped",
                                     true);
                     }
                 }
@@ -1995,6 +2408,9 @@ private:
         maybe_check_settings();
         update_status();
 
+        const double interval =
+            config_.flush_interval_seconds > 0.0 ? config_.flush_interval_seconds : 3600.0;
+        double next_timer_flush = now_unix_seconds() + interval;
         for (;;) {
             // With the Microsoft runtime std::set_terminate is per thread:
             // the worker gets the handler too, once, while it is armed.
@@ -2003,32 +2419,51 @@ private:
             bool do_shutdown = false;
             bool force = false;
             bool wake = false;
+            bool persist_only = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
+                persist_locked();
                 if (commands_.empty() && !shutdown_requested_ && !nudge_ && !wake_) {
-                    double wait = config_.flush_interval_seconds > 0.0
-                                      ? config_.flush_interval_seconds
-                                      : 3600.0;
+                    const double now = now_unix_seconds();
+                    double wait = std::max(0.0, next_timer_flush - now);
                     if (!queue_.is_empty()) {
-                        const double retry = queue_.seconds_until_next_attempt(now_unix_seconds());
+                        const double retry = queue_.seconds_until_next_attempt(now);
                         if (retry > 0.0 && retry < wait) {
                             wait = std::max(retry, limits::min_retry_seconds);
                         }
                     }
-                    cv_.wait_for(lock, std::chrono::duration<double>(wait), [this] {
-                        return shutdown_requested_ || nudge_ || wake_ || !commands_.empty();
+                    const unsigned long long kicks = persist_kicks_;
+                    const bool fired = cv_.wait_for(lock, std::chrono::duration<double>(wait), [&] {
+                        return shutdown_requested_ || nudge_ || wake_ || !commands_.empty() ||
+                               persist_kicks_ != kicks;
                     });
+                    if (fired && persist_kicks_ != kicks && !shutdown_requested_ && !nudge_ &&
+                        !wake_ && commands_.empty()) {
+                        // Only a new event to save: give it a second to
+                        // collect company, then write once.
+                        cv_.wait_for(lock, std::chrono::duration<double>(
+                                               std::min(1.0, std::max(0.0, next_timer_flush - now_unix_seconds()))),
+                                     [&] { return shutdown_requested_ || nudge_ || wake_ || !commands_.empty(); });
+                        persist_locked();
+                        persist_only = now_unix_seconds() < next_timer_flush && !shutdown_requested_ &&
+                                       !nudge_ && !wake_ && commands_.empty();
+                    }
                 }
-                if (!commands_.empty()) {
-                    command = std::move(commands_.front());
-                    commands_.pop_front();
-                } else {
-                    force = nudge_;
-                    wake = wake_;
-                    nudge_ = false;
-                    wake_ = false;
-                    do_shutdown = shutdown_requested_;
+                if (!persist_only) {
+                    if (!commands_.empty()) {
+                        command = std::move(commands_.front());
+                        commands_.pop_front();
+                    } else {
+                        force = nudge_;
+                        wake = wake_;
+                        nudge_ = false;
+                        wake_ = false;
+                        do_shutdown = shutdown_requested_;
+                    }
                 }
+            }
+            if (persist_only) {
+                continue;
             }
             if (command) {
                 command();
@@ -2040,6 +2475,11 @@ private:
             }
             if (config_.flush_interval_seconds > 0.0 || force || wake) {
                 flush_cycle(force);
+            }
+            next_timer_flush = now_unix_seconds() + interval;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                persist_locked();
             }
             update_status();
         }
@@ -2066,7 +2506,7 @@ private:
                     Event event;
                     event.name = "health";
                     event.data_json = write_fields(summary);
-                    event.timestamp = static_cast<long long>(now_unix_seconds());
+                    event.timestamp = now_unix_ms();
                     enqueue_locked(std::move(event));
                 }
             }
@@ -2074,11 +2514,15 @@ private:
                 exited_queued_ = true;
                 Event event;
                 event.name = "game_exited";
-                event.timestamp = static_cast<long long>(now_unix_seconds());
+                event.timestamp = now_unix_ms();
                 enqueue_locked(std::move(event));
             }
         }
         flush_cycle(true);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            persist_locked();
+        }
         update_status();
     }
 
@@ -2152,6 +2596,24 @@ private:
     const std::chrono::steady_clock::time_point run_start_ = std::chrono::steady_clock::now();
     bool shutdown_requested_ = false;
 
+    // Delivery contract state, guarded by mutex_.
+    std::string queue_path_;
+    std::string attribution_path_;
+    std::string device_;
+    std::string current_origin_;
+    std::string current_session_id_;
+    std::string signing_secret_;
+    long long clock_offset_seconds_ = 0;
+    unsigned long long persisted_revision_ = 0;
+    unsigned long long persist_kicks_ = 0;
+    unsigned long long loaded_through_sequence_ = 0;
+    bool persist_frozen_ = false;
+    bool persist_warned_ = false;
+    bool delivery_loaded_ = false;
+    bool gzip_refused_ = false;
+    bool attribution_sent_ = false;
+    std::vector<std::pair<std::string, std::string>> exposed_;
+
     std::thread worker_;
 };
 
@@ -2209,6 +2671,21 @@ std::string Client::get_config_string(const std::string& key, const std::string&
 json::Value Client::get_config_json(const std::string& key, const json::Value& fallback) const {
     auto value = impl_->config_value(key); return value.is_object() || value.is_array() ? value : fallback;
 }
+
+bool Client::track_ad(const AdEvent& ad) { return impl_->track_ad(ad); }
+bool Client::track_ad_revenue(const std::string& network, const std::string& format,
+                              const std::string& placement, const std::string& revenue_micros,
+                              const std::string& currency) {
+    AdEvent ad;
+    ad.network = network;
+    ad.format = format;
+    ad.result = "shown";
+    ad.placement = placement;
+    ad.revenue_micros = revenue_micros;
+    ad.currency = currency;
+    return impl_->track_ad(ad);
+}
+bool Client::set_attribution(const Attribution& attribution) { return impl_->set_attribution(attribution); }
 
 void Client::set_enabled(bool enabled) { impl_->set_enabled(enabled); }
 bool Client::is_enabled() const { return impl_->is_enabled(); }
