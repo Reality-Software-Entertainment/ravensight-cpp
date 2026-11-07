@@ -308,7 +308,7 @@ RS_TEST(session_request_names_the_sdk) {
             seen = true;
             const json::Value body = json::Value::parse(request.body);
             CHECK_EQ(body.get_string("sdk", ""), std::string("cpp/") + RAVENSIGHT_VERSION);
-            CHECK_EQ(std::string(RAVENSIGHT_VERSION), std::string("0.4.0"));
+            CHECK_EQ(std::string(RAVENSIGHT_VERSION), std::string("0.5.0"));
         }
     }
     CHECK(seen);

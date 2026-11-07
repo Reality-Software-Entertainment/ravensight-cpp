@@ -58,7 +58,7 @@ issue with anything you hit.
 include(FetchContent)
 FetchContent_Declare(ravensight
     GIT_REPOSITORY https://github.com/Reality-Software-Entertainment/ravensight-cpp.git
-    GIT_TAG v0.4.0)
+    GIT_TAG v0.5.0)
 FetchContent_MakeAvailable(ravensight)
 
 target_link_libraries(your_game PRIVATE ravensight::ravensight)
