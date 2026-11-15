@@ -32,5 +32,5 @@ No live service requests, pushes, tags or publication were performed.
   multipart, processing receipts, same-handle retry, reset/opt-out races, failed upload
   without fallback/finalization, invalid grants and bounded preparation.
 - Evidence: `/tmp/rs-cpp-reports-build.log`, `/tmp/rs-cpp-reports-tests.log`.
-- Tests use scripted transport. Actual S3, packaged games and device integration remain
+- Tests use scripted transport. Actual storage uploads, packaged games and device integration remain
   release checks; no publishing, tagging, pushes or deployments were performed.
