@@ -18,7 +18,8 @@ server whose session answer carries `identify.salt` and that offers
   raw id is held in memory only until the salt is known.
 * A different salt deletes the saved identity, a session answer with no
   salt drops a held id for the launch, signing in as another account resets
-  first, and opt-out, consent withdrawn and `set_enabled(false)` forget it.
+  first, and opt-out and consent withdrawn forget it. `set_enabled(false)`
+  keeps it. A playtest run keeps it in memory and sends nothing.
 * The contract's binding vectors in `tests/fixtures/identify-vectors.json`.
 
 ## [0.5.0] - 2026-11-06

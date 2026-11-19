@@ -776,8 +776,10 @@ client.reset_identity();         // on sign-out
   device is not linked to the account. `reset_device_id()` alone keeps it.
 - **Signing in as another account** calls `reset_identity()` for you first.
 - **Consent:** without a key, or with `Consent::opt_in` before the yes, the
-  id waits in memory and nothing is sent. Opting out, or
-  `set_enabled(false)`, forgets it.
+  id waits in memory and nothing is sent. The player's opt-out
+  (`set_tracking_enabled(false)`) forgets it; your own switch,
+  `set_enabled(false)`, keeps it and identifies again when turned back on.
+  A playtest run keeps it in memory and sends nothing.
 - **Cost:** one event on your usage meter per identified session. The call
   runs on the worker after queued events and never delays them.
 
