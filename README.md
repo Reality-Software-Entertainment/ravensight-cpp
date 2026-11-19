@@ -881,3 +881,7 @@ reports use 1 event. Charges, processing, cancellation and refunds are server-au
 An upload/finalization error is not proof that a report was uncharged: explicitly poll or
 cancel the same handle. Enable the Player Reports backend and worker before integration.
 The storage upload uses HTTPS multipart with no ingest, session or playtest credentials.
+
+## Contributing
+
+Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
