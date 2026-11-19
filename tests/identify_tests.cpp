@@ -862,3 +862,84 @@ RS_TEST(identify_opt_out_and_reset_identity_delete_a_saved_identity_before_conse
     settle();
     CHECK_EQ(server->sends().size(), static_cast<std::size_t>(1));
 }
+
+// --- no_session in a row (the same rule as the other six SDKs) -------------------
+
+namespace {
+
+/// Answers each identify from a script, then 200.
+void script_identify(const std::shared_ptr<Server>& server, std::vector<std::pair<long, std::string>> answers) {
+    auto shared = std::make_shared<std::vector<std::pair<long, std::string>>>(std::move(answers));
+    auto index = std::make_shared<std::size_t>(0);
+    std::lock_guard<std::mutex> lock(server->mutex);
+    server->on_identify = [shared, index](const Request&) {
+        if (*index < shared->size()) {
+            const auto& next = (*shared)[(*index)++];
+            return reply(next.first, next.second);
+        }
+        return reply(200, "{\"playerId\":\"px_0\"}");
+    };
+}
+
+/// A fresh session (the identity is kept), then waits for any identify.
+void next_session(Client& client) {
+    client.reset_device_id();
+    open_session(client);
+    settle();
+}
+
+const std::pair<long, std::string> no_session{400, "{\"error\":\"no_session\"}"};
+
+} // namespace
+
+RS_TEST(identify_two_no_session_answers_in_a_row_stop_identify) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    script_identify(server, {no_session, no_session});
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    open_session(client);
+    const std::string last_error = client.stats().last_error;
+    CHECK(client.identify("u1"));
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    next_session(client); // the first no_session: tried once at the next session
+    REQUIRE(wait_for([&] { return server->sends().size() == 2; }));
+    next_session(client); // a second in a row: stopped
+    next_session(client);
+    CHECK_EQ(server->sends().size(), static_cast<std::size_t>(2));
+    CHECK(client.is_identified()); // the identity is kept
+    CHECK_EQ(client.stats().last_error, last_error);
+}
+
+RS_TEST(identify_no_session_then_another_answer_then_no_session_does_not_stop) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    script_identify(server, {no_session, {503, "{}"}, no_session});
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    open_session(client);
+    CHECK(client.identify("u1"));
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    next_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 2; }));
+    next_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 3; }));
+    next_session(client);
+    CHECK(wait_for([&] { return server->sends().size() == 4; }));
+}
+
+RS_TEST(identify_reset_identity_turns_identify_back_on_after_no_session_stopped_it) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    script_identify(server, {no_session, no_session});
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    open_session(client);
+    CHECK(client.identify("u1"));
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    next_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 2; }));
+    next_session(client);
+    CHECK_EQ(server->sends().size(), static_cast<std::size_t>(2));
+    client.reset_identity();
+    CHECK(client.identify("u1"));
+    open_session(client);
+    CHECK(wait_for([&] { return server->sends().size() == 3; }));
+}
