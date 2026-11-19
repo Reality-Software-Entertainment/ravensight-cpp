@@ -637,6 +637,10 @@ public:
             inert_ = true;
             paths_ = resolve_paths(config_);
             opted_out_ = !read_allowed(paths_.state_file, consent_);
+            if (!paths_.state_file.empty()) {
+                // Never read without a key; deleted on opt-out or reset_identity.
+                identity_path_ = detail::join_path(detail::parent_dir(paths_.state_file), "identity");
+            }
             apply_local_state_locked();
             if (!config_.optional) {
                 const std::string line =
@@ -1124,14 +1128,14 @@ public:
         const bool was_active = queue_.is_active();
         enabled_ = enabled;
         apply_local_state_locked();
-        if (!enabled) {
-            // Switched off: the identity goes, as on an opt-out.
-            forget_identity_locked();
-        }
+        // The game's own switch keeps the identity (the player's opt-out
+        // deletes it); back on, a held id settles and the open session is
+        // identified.
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
         settle_identity_locked();
+        if (enabled) schedule_identify_locked();
         update_capture_locked();
         schedule_settings_check_locked();
     }
@@ -1176,6 +1180,7 @@ public:
             on_locally_enabled_locked();
         }
         settle_identity_locked();
+        if (enabled) schedule_identify_locked();
         update_capture_locked();
         if (!enabled) {
             // The player said no: a crash saved earlier is never sent.
@@ -1260,9 +1265,15 @@ public:
             note_locked("identify is not available from this server; the account id was not kept", false);
             return true;
         }
+        if (launch_salt_.empty()) {
+            // This launch's salt is not known yet, and a saved identity may
+            // be another game's: hold the id (the last call wins) and decide
+            // when the session answer brings the salt.
+            held_account_ = account_id;
+            return true;
+        }
         if (!identity_hash_.empty()) {
-            // The stored salt is the game's: compare the accounts with it.
-            if (detail::identify_account_hash(identity_salt_, account_id) == identity_hash_) {
+            if (detail::identify_account_hash(launch_salt_, account_id) == identity_hash_) {
                 held_account_.clear();
                 schedule_identify_locked();
                 return true;
@@ -1277,7 +1288,9 @@ public:
 
     void reset_identity() {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (identity_hash_.empty() && held_account_.empty()) {
+        std::string on_disk;
+        const bool saved = !identity_path_.empty() && detail::read_text_file(identity_path_, on_disk);
+        if (identity_hash_.empty() && held_account_.empty() && !saved) {
             return;
         }
         reset_identity_locked();
@@ -1633,7 +1646,7 @@ private:
     }
 
     void schedule_identify_locked() {
-        if (inert_ || identity_hash_.empty()) {
+        if (inert_ || is_playtest_ || identity_hash_.empty()) {
             return;
         }
         identify_due_ = true;
@@ -1642,9 +1655,11 @@ private:
     }
 
     // A session answer: the game's salt, or none from an older server.
-    void apply_identify_answer_locked(const json::Value& answer) {
+    // Returns true when another account was signed out, which also dropped
+    // the session that just opened.
+    bool apply_identify_answer_locked(const json::Value& answer) {
         if (identify_no_salt_) {
-            return;
+            return false;
         }
         const json::Value* identify = answer.find("identify");
         const std::string salt =
@@ -1656,7 +1671,7 @@ private:
                 held_account_.clear();
                 note_locked("identify is not available from this server; the account id was dropped", false);
             }
-            return;
+            return false;
         }
         launch_salt_ = salt;
         if (!identity_hash_.empty() && identity_salt_ != salt) {
@@ -1667,8 +1682,22 @@ private:
             ++identify_generation_;
             note_locked("forgot an identity saved under another game's key", false);
         }
+        bool signed_out = false;
+        if (!held_account_.empty() && !identity_hash_.empty()) {
+            if (detail::identify_account_hash(salt, held_account_) == identity_hash_) {
+                held_account_.clear();
+            } else {
+                // Another account was identified before the salt was known:
+                // sign the saved one out first (fresh device and session).
+                const std::string waiting = held_account_;
+                reset_identity_locked();
+                held_account_ = waiting;
+                signed_out = true;
+            }
+        }
         settle_identity_locked();
         schedule_identify_locked();
+        return signed_out;
     }
 
     // Worker thread: one POST /identify for the current session, after the
@@ -1682,12 +1711,14 @@ private:
             if (!identify_due_) {
                 return;
             }
-            if (identity_hash_.empty() || identify_stopped_ || identify_no_salt_ ||
+            if (identity_hash_.empty() || identify_stopped_ || identify_no_salt_ || is_playtest_ ||
                 !queue_.is_active() || shutdown_requested_) {
                 identify_due_ = false;
                 return;
             }
-            if (!queue_.is_session_valid(now_unix_seconds()) || launch_salt_ != identity_salt_) {
+            // The token the session answer returned, as held; no expiry
+            // check against this device's clock.
+            if (queue_.session_token().empty() || launch_salt_ != identity_salt_) {
                 return; // the next session answer asks again
             }
             identify_due_ = false;
@@ -2251,7 +2282,6 @@ private:
                 }
                 queue_.set_session(token, expires_at);
                 apply_capture_answer_locked(parsed);
-                apply_identify_answer_locked(parsed);
                 if (join_token_ == join_token) {
                     join_token_.clear();
                 }
@@ -2278,6 +2308,12 @@ private:
                     }
                 }
                 transient_ = Status::ok;
+                if (apply_identify_answer_locked(parsed)) {
+                    // Another account signed in before the salt was known:
+                    // the saved one was signed out with this session.
+                    note_locked("signed out the saved account; a new session opens for the next one", false);
+                    return false;
+                }
                 note_locked("session ready", false);
                 if (!config_pending_ && !shutdown_requested_) {
                     config_pending_ = true;

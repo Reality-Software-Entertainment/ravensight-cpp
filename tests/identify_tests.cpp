@@ -424,10 +424,12 @@ RS_TEST(identify_sequence_holds) {
         open_session(client);
         REQUIRE(wait_for([&] { return server->sends().size() == 5; }));
         CHECK(!stored(dir).is_null());
-        client.set_enabled(false);
+        // The player's opt-out (consent withdrawn). The game's own switch,
+        // set_enabled(false), keeps it: a settled cross-SDK decision.
+        client.set_tracking_enabled(false);
         CHECK(stored(dir).is_null());
         CHECK(!client.is_identified());
-        client.set_enabled(true);
+        client.set_tracking_enabled(true);
         open_session(client);
         settle();
         CHECK_EQ(server->sends().size(), static_cast<std::size_t>(5));
@@ -660,3 +662,203 @@ RS_TEST(identify_a_late_200_after_reset_does_not_mark_the_new_session) { late_an
 
 // A late 404 would stop identify for the launch if it were applied.
 RS_TEST(identify_a_late_404_after_reset_changes_nothing) { late_answer_after_reset(404); }
+
+// --- Cross-SDK review findings (F1 to F8) and settled decisions ------------------
+
+RS_TEST(identify_the_game_switch_keeps_the_identity) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    CHECK(client.identify("u1"));
+    open_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    client.set_enabled(false);
+    CHECK(!stored(dir).is_null());
+    CHECK(client.is_identified());
+}
+
+RS_TEST(identify_turning_collection_back_on_in_an_open_session_sends) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    open_session(client);
+    client.set_enabled(false);
+    CHECK(client.identify("u1")); // held: the client may not save now
+    settle();
+    CHECK(server->sends().empty());
+    CHECK(stored(dir).is_null());
+    client.set_enabled(true);
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    CHECK_EQ(server->sends()[0].first, std::string("S1"));
+    CHECK(!stored(dir).is_null());
+}
+
+RS_TEST(identify_before_the_salt_holds_the_id_and_hashes_under_the_salt_that_arrives) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    const Config config = identify_config(dir);
+    {
+        Client client(config, std::make_unique<Wire>(server));
+        CHECK(client.identify("12345"));
+        open_session(client);
+        REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    }
+    const json::Value* differ = vectors().find("salts_differ");
+    {
+        std::lock_guard<std::mutex> lock(server->mutex);
+        server->salt = differ->get_string("salt_b", "");
+    }
+    Client client(config, std::make_unique<Wire>(server));
+    const std::string device = client.device_id();
+    CHECK(client.identify("12345")); // the saved salt is not this launch's yet
+    open_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 2; }));
+    CHECK_EQ(server->sends()[1].second, differ->get_string("wire_b", ""));
+    CHECK_EQ(stored(dir).get_string("salt", ""), differ->get_string("salt_b", ""));
+    CHECK_EQ(client.device_id(), device); // the old one was deleted, not signed out
+}
+
+RS_TEST(identify_another_account_before_the_salt_signs_the_saved_one_out_when_it_arrives) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    const Config config = identify_config(dir);
+    {
+        Client client(config, std::make_unique<Wire>(server));
+        CHECK(client.identify("u1"));
+        open_session(client);
+        REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    }
+    Client client(config, std::make_unique<Wire>(server));
+    const std::string device = client.device_id();
+    CHECK(client.identify("u2"));
+    CHECK_EQ(client.device_id(), device); // nothing decided before the salt
+    open_session(client); // S2 answers the salt: u1 is signed out first
+    CHECK(client.device_id() != device);
+    open_session(client); // a fresh session for the fresh device
+    REQUIRE(wait_for([&] { return server->sends().size() == 2; }));
+    CHECK_EQ(server->sends()[1].first, std::string("S3"));
+    CHECK_EQ(server->sends()[1].second, step(5, "identify(\"u2\")").find("expect")->find("sends")->at(0).get_string("accountHash", ""));
+}
+
+RS_TEST(identify_two_calls_before_the_salt_the_last_wins) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    const std::string device = client.device_id();
+    CHECK(client.identify("u1"));
+    CHECK(client.identify("u2"));
+    open_session(client);
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    settle();
+    CHECK_EQ(server->sends().size(), static_cast<std::size_t>(1));
+    CHECK_EQ(server->sends()[0].second, step(5, "identify(\"u2\")").find("expect")->find("sends")->at(0).get_string("accountHash", ""));
+    CHECK_EQ(client.device_id(), device);
+}
+
+RS_TEST(identify_never_opens_a_session_under_a_retry_after_hold) {
+    std::atomic<bool> refuse{true};
+    Config config = identify_config(rstest::make_temp_dir());
+    struct Hold : Transport {
+        std::shared_ptr<Server> server;
+        std::atomic<bool>* refuse;
+        Response send(const Request& request) override {
+            if (refuse->load() && ends_with(request.url, "/session")) {
+                std::lock_guard<std::mutex> lock(server->mutex);
+                server->requests.push_back(request);
+                Response r = reply(429, "{\"error\":\"rate_limited\"}");
+                r.retry_after = "600";
+                return r;
+            }
+            return server->handle(request);
+        }
+    };
+    auto held_server = std::make_shared<Server>();
+    auto transport = std::make_unique<Hold>();
+    transport->server = held_server;
+    transport->refuse = &refuse;
+    Client held(config, std::move(transport));
+    held.track("tick");
+    held.flush();
+    REQUIRE(wait_for([&] { return held_server->count("/session") == 1; }));
+    CHECK(held.identify("u1"));
+    held.flush(); // an automatic attempt waits out the hold
+    settle();
+    CHECK_EQ(held_server->count("/session"), static_cast<std::size_t>(1));
+    CHECK_EQ(held_server->count("/identify"), static_cast<std::size_t>(0));
+}
+
+RS_TEST(identify_is_sent_on_the_answered_token_whatever_the_device_clock_says) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    struct PastExpiry : Transport {
+        std::shared_ptr<Server> server;
+        Response send(const Request& request) override {
+            Response response = server->handle(request);
+            if (ends_with(request.url, "/session")) {
+                // expiresAt already past by this device's clock.
+                const std::string marker = "\"expiresIn\":3600";
+                const std::size_t at = response.body.find(marker);
+                if (at != std::string::npos) response.body.replace(at, marker.size(), "\"expiresAt\":1000");
+            }
+            return response;
+        }
+    };
+    auto transport = std::make_unique<PastExpiry>();
+    transport->server = server;
+    Client client(identify_config(dir), std::move(transport));
+    CHECK(client.identify("u1"));
+    client.track("tick");
+    client.flush();
+    REQUIRE(wait_for([&] { return !server->sends().empty(); }));
+    CHECK_EQ(server->sends()[0].first.rfind("S", 0), static_cast<std::size_t>(0));
+}
+
+RS_TEST(identify_a_playtest_run_keeps_it_in_memory_and_sends_nothing) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    Config config = identify_config(dir);
+    config.playtest_token = "pt_token";
+    config.playtest_run_id = "run1";
+    Client client(config, std::make_unique<Wire>(server));
+    CHECK(client.identify("u1"));
+    open_session(client);
+    settle();
+    CHECK(client.is_identified());
+    CHECK(server->sends().empty());
+    CHECK(stored(dir).is_null());
+}
+
+RS_TEST(identify_failures_leave_the_last_error_alone) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    server->on_identify = [](const Request&) { return reply(503, "{\"error\":\"unavailable\"}"); };
+    Client client(identify_config(dir), std::make_unique<Wire>(server));
+    open_session(client);
+    const std::string before = client.stats().last_error;
+    CHECK(client.identify("u1"));
+    REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    settle();
+    CHECK_EQ(client.stats().last_error, before);
+    CHECK(client.status() == Status::ok);
+}
+
+RS_TEST(identify_opt_out_and_reset_identity_delete_a_saved_identity_before_consent) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<Server>();
+    Config config = identify_config(dir);
+    {
+        Client client(config, std::make_unique<Wire>(server));
+        CHECK(client.identify("u1"));
+        open_session(client);
+        REQUIRE(wait_for([&] { return server->sends().size() == 1; }));
+    }
+    // A later build asks for consent: the identity on disk is not kept before the yes.
+    config.consent = Consent::opt_in;
+    Client client(config, std::make_unique<Wire>(server));
+    client.set_tracking_enabled(false);
+    CHECK(stored(dir).is_null());
+    client.reset_identity();
+    CHECK(stored(dir).is_null());
+    settle();
+    CHECK_EQ(server->sends().size(), static_cast<std::size_t>(1));
+}
