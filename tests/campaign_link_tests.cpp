@@ -361,6 +361,24 @@ RS_TEST(campaign_link_set_while_a_session_is_in_flight_waits_for_the_next_sessio
     CHECK(server->links() == (Links{kLink, kOther}));
 }
 
+RS_TEST(campaign_link_the_same_link_set_again_while_in_flight_goes_once) {
+    const std::string dir = rstest::make_temp_dir();
+    auto server = std::make_shared<LinkServer>();
+    server->hold_sessions = true;
+    server->batch_401s = 1;
+    Client client(link_config(dir), std::make_unique<Wire>(server));
+    CHECK(client.set_campaign_link(kLink));
+    client.track("tick");
+    client.flush();
+    REQUIRE(wait_for([&] { return server->session_requests().size() == 1; }));
+    // Changed and changed back while the open session already carries it.
+    CHECK(client.set_campaign_link(kOther));
+    CHECK(client.set_campaign_link(upper(kLink)));
+    server->release_sessions();
+    REQUIRE(wait_for([&] { return server->session_requests().size() == 2; }));
+    CHECK(server->links() == (Links{kLink, ""}));
+}
+
 // --- Gates ----------------------------------------------------------------------------
 
 RS_TEST(campaign_link_waits_for_consent_and_goes_with_the_first_session_after_the_yes) {
