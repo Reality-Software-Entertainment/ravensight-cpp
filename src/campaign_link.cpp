@@ -48,12 +48,13 @@ std::string form_decode(const std::string& text) {
 /// bigger buffer). 0 when there is none or it cannot be read. The address
 /// keeps its query percent-encoded, so it is ASCII; anything else is
 /// treated as none. Runs on the browser's main thread, where the page is,
-/// even when called from a worker thread.
+/// even when called from a worker thread. Double quotes only in the script:
+/// the C preprocessor reads it first.
 int read_page_search(char* out, int capacity) {
     return MAIN_THREAD_EM_ASM_INT({
-        var search = '';
+        var search = "";
         try {
-            if (typeof location !== 'undefined' && location && typeof location.search === 'string') {
+            if (typeof location !== "undefined" && location && typeof location.search === "string") {
                 search = location.search;
             }
         } catch (e) {
