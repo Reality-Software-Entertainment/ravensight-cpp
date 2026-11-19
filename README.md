@@ -135,6 +135,7 @@ Everything game code needs is on `ravensight::Client`:
 | `client.fetch_suggestions(callback)` | EXPERIMENTAL. AI generated design suggestions for your game. |
 | `client.set_tracking_enabled(bool)` | The player's analytics choice, saved and remembered across launches. |
 | `client.reset_device_id()` | A fresh random identity from now on. Returns the new id. |
+| `client.set_campaign_link(id)` | The campaign link id your deep link handler received, sent once with the next session. See [Campaign links](#campaign-links). |
 | `client.set_enabled(bool)` | Runtime on and off for your own logic. Not saved. |
 | `client.is_collecting()` | True only while the client is collecting: a key, enabled, the player's choice allows it, the kill switch on and the key accepted. |
 | `client.status()` | Why the client is or is not sending (see [Status and reasons](#status-and-reasons)). |
@@ -785,6 +786,60 @@ client.reset_identity();         // on sign-out
 
 A game that calls `identify` links its data to the player's account:
 answer the store privacy forms that way.
+
+## Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at
+a web page adds `rs_link=<link id>` to the address it redirects to. The
+client sends that id once, as `campaignLink`, with the first session it
+opens for the player. The server keeps it only when it names a link of the
+same game, then counts the player and the session on the Campaign links
+page, by link, and the players open in Player insights.
+
+**A web build made with Emscripten** reads `rs_link` from the page's
+address (`location.search`) by itself, once, when the first client is
+constructed. Nothing to call, and the address is left as it is.
+
+**A native build** cannot see how the game was opened, so pass the id on
+from the handler that already receives the address: your deep link,
+universal link or App Link handler, or the install referrer. Point the
+link at your own https page, which is also your universal link or App
+Link, and the address the game receives carries `rs_link`:
+
+```cpp
+// url: the address that opened the game, for example
+// https://play.example.com/open?rs_link=64b0000000000000000000a1
+void on_open_url(ravensight::Client& client, const std::string& url) {
+    const std::size_t query = url.find('?');
+    if (query == std::string::npos) return;
+    const std::string params = url.substr(query + 1, url.find('#', query) - query - 1);
+    for (std::size_t start = 0; start < params.size();) {
+        std::size_t end = params.find('&', start);
+        if (end == std::string::npos) end = params.size();
+        if (params.compare(start, 8, "rs_link=") == 0) {
+            client.set_campaign_link(params.substr(start + 8, end - start - 8));
+            return;
+        }
+        start = end + 1;
+    }
+}
+```
+
+`set_campaign_link` returns true when the id is a link id (24 hex
+characters, any case) and is now waiting, and false for anything else,
+which changes nothing. A later valid call replaces one still waiting. Call
+it before the first session when you can; a call after that goes with the
+next session the client opens.
+
+- **Once:** a failed session keeps the link for the next attempt. Once the
+  server accepts a session that carried it, it is forgotten, and later
+  sessions (a renewal, a new device id) carry none.
+- **Consent:** the same as everything else. With `Consent::opt_in` it waits
+  for the player's yes and goes with the first session after it. An opted
+  out player, a client with no key, a playtest run and a session opened with
+  a join token send nothing.
+- **Nothing stored:** it is held in memory only, never written to disk. The
+  id is one your studio created, not personal data.
 
 ## Telling players
 
