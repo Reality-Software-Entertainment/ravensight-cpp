@@ -810,9 +810,10 @@ Link, and the address the game receives carries `rs_link`:
 // url: the address that opened the game, for example
 // https://play.example.com/open?rs_link=64b0000000000000000000a1
 void on_open_url(ravensight::Client& client, const std::string& url) {
-    const std::size_t query = url.find('?');
+    const std::string address = url.substr(0, url.find('#'));
+    const std::size_t query = address.find('?');
     if (query == std::string::npos) return;
-    const std::string params = url.substr(query + 1, url.find('#', query) - query - 1);
+    const std::string params = address.substr(query + 1);
     for (std::size_t start = 0; start < params.size();) {
         std::size_t end = params.find('&', start);
         if (end == std::string::npos) end = params.size();
