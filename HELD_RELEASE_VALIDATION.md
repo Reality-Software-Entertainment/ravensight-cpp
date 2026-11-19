@@ -34,3 +34,10 @@ No live service requests, pushes, tags or publication were performed.
 - Evidence: `/tmp/rs-cpp-reports-build.log`, `/tmp/rs-cpp-reports-tests.log`.
 - Tests use scripted transport. Actual storage uploads, packaged games and device integration remain
   release checks; no publishing, tagging, pushes or deployments were performed.
+
+## 0.6.0: identify players who sign in (November 19, 2026)
+
+- Branch `feat/identify`, built to the platform's identify contract version 2.
+- `cmake` Release build and `ravensight_tests`: **239 tests passed**, 0 failed
+  (213 before), every identify case against a fake transport.
+- No live Ravensight service was used. Nothing was published, tagged or deployed.
