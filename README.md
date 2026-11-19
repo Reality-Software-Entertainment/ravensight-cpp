@@ -58,7 +58,7 @@ issue with anything you hit.
 include(FetchContent)
 FetchContent_Declare(ravensight
     GIT_REPOSITORY https://github.com/Reality-Software-Entertainment/ravensight-cpp.git
-    GIT_TAG v0.5.0)
+    GIT_TAG v0.6.0)
 FetchContent_MakeAvailable(ravensight)
 
 target_link_libraries(your_game PRIVATE ravensight::ravensight)
@@ -749,6 +749,40 @@ A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
+
+## Identify players who sign in
+
+If your game has its own accounts, tell the client who signed in, so one
+person on two devices, or before and after sign-in, counts as one player:
+
+```cpp
+client.identify(account.id());   // after your own sign-in succeeds
+client.reset_identity();         // on sign-out
+```
+
+- **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
+  game's own salt, which the session answer gives the client) and the
+  session token, once per session. The raw account id is never sent and
+  never written to disk; emails and names are never sent.
+- **Checked on the device:** the id must not be empty, must be at most 256
+  bytes of UTF-8 and must not contain `@`, so an email or a handle is
+  refused. It is used exactly as given (never trimmed). A refusal returns
+  `false`, logs one line and changes nothing.
+- **Remembered:** only the hash and the salt are saved, in a file named
+  `identity` beside the device id, so the next launch identifies its
+  session without another call. `is_identified()` says whether one is set.
+- **`reset_identity()`** on sign-out forgets it and switches to a fresh
+  device id, exactly like `reset_device_id()`, so the next player on this
+  device is not linked to the account. `reset_device_id()` alone keeps it.
+- **Signing in as another account** calls `reset_identity()` for you first.
+- **Consent:** without a key, or with `Consent::opt_in` before the yes, the
+  id waits in memory and nothing is sent. Opting out, or
+  `set_enabled(false)`, forgets it.
+- **Cost:** one event on your usage meter per identified session. The call
+  runs on the worker after queued events and never delays them.
+
+A game that calls `identify` links its data to the player's account:
+answer the store privacy forms that way.
 
 ## Telling players
 
