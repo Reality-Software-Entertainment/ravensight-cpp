@@ -621,6 +621,22 @@ public:
     /// session answer. The account id itself can never be read back.
     bool is_identified() const;
 
+    // --- Campaign links ----------------------------------------------------
+
+    /// The Ravensight campaign link this player arrived by: the `rs_link`
+    /// value (24 hex characters) your deep link, universal link, App Link
+    /// or install referrer handler pulled out of the incoming address. It
+    /// goes once, as `campaignLink`, with the next session this client
+    /// opens for its player, and is forgotten when the server accepts that
+    /// session; a failed attempt keeps it for the next. Returns true when
+    /// `link_id` is a link id and is now waiting; anything else returns
+    /// false and leaves a waiting link as it was. A later valid call
+    /// replaces it. Best called before the first session. Never sent in a
+    /// playtest run or with a join token, before consent, or without a
+    /// key, and never written to disk. An Emscripten build reads `rs_link`
+    /// from the page's address by itself when the client is constructed.
+    bool set_campaign_link(const std::string& link_id);
+
     // --- State -------------------------------------------------------------
 
     /// Why the client is or is not sending. Changes are also reported to

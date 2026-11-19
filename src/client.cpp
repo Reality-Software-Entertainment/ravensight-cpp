@@ -2972,6 +2972,7 @@ std::string Client::reset_device_id() { return impl_->reset_device_id(); }
 bool Client::identify(const std::string& account_id) { return impl_->identify(account_id); }
 void Client::reset_identity() { impl_->reset_identity(); }
 bool Client::is_identified() const { return impl_->is_identified(); }
+bool Client::set_campaign_link(const std::string&) { return false; }
 Status Client::status() const { return impl_->status(); }
 bool Client::tracking_enabled() const { return impl_->tracking_enabled(); }
 bool Client::is_ready() const { return impl_->is_ready(); }
