@@ -84,7 +84,8 @@ if(RAVENSIGHT_BUILD_TESTS)
         tests/error_capture_tests.cpp
         tests/error_capture_client_tests.cpp
         tests/delivery_tests.cpp
-        tests/wave_client_tests.cpp)
+        tests/wave_client_tests.cpp
+        tests/identify_tests.cpp)
     target_link_libraries(ravensight_tests PRIVATE ravensight::ravensight)
     target_include_directories(ravensight_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_compile_definitions(ravensight_tests PRIVATE
