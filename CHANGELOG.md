@@ -22,8 +22,8 @@ server whose session answer carries `identify.salt` and that offers
   keeps it. A playtest run keeps it in memory and sends nothing.
 * The contract's binding vectors in `tests/fixtures/identify-vectors.json`.
 * Campaign links: `Client::set_campaign_link(link_id)` for a deep link, universal link,
-  App Link or install referrer, and an Emscripten build reads `rs_link` from the page's
-  address. The id goes once, as `campaignLink`, on the player's next `POST /session`.
+  App Link or install referrer. The id goes once, as `campaignLink`, on the player's next
+  `POST /session`.
 
 ## [0.5.0] - 2026-11-06
 

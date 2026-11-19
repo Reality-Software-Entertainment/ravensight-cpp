@@ -796,11 +796,8 @@ opens for the player. The server keeps it only when it names a link of the
 same game, then counts the player and the session on the Campaign links
 page, by link, and the players open in Player insights.
 
-**A web build made with Emscripten** reads `rs_link` from the page's
-address (`location.search`) by itself, once, when the first client is
-constructed. Nothing to call, and the address is left as it is.
-
-**A native build** cannot see how the game was opened, so pass the id on
+The web is not a supported target for this SDK, so a game passes the id
+on itself. A native build cannot see how the game was opened, so pass it on
 from the handler that already receives the address: your deep link,
 universal link or App Link handler, or the install referrer. Point the
 link at your own https page, which is also your universal link or App

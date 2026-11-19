@@ -633,8 +633,9 @@ public:
     /// false and leaves a waiting link as it was. A later valid call
     /// replaces it. Best called before the first session. Never sent in a
     /// playtest run or with a join token, before consent, or without a
-    /// key, and never written to disk. An Emscripten build reads `rs_link`
-    /// from the page's address by itself when the client is constructed.
+    /// key, and never written to disk. The web is not a supported target;
+    /// a build compiled with Emscripten anyway reads `rs_link` from the
+    /// page's address once, when the first client is constructed.
     bool set_campaign_link(const std::string& link_id);
 
     // --- State -------------------------------------------------------------
