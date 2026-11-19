@@ -23,6 +23,7 @@ add_library(ravensight
     src/error_capture.cpp
     src/delivery.cpp
     src/health.cpp
+    src/identify.cpp
     src/json.cpp
     src/queue.cpp
     src/storage.cpp

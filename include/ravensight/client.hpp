@@ -595,6 +595,32 @@ public:
     /// inert client.
     std::string reset_device_id();
 
+    // --- Identify players who sign in --------------------------------------
+
+    /// Links this device to the game's own account id, so one person on
+    /// two devices, or before and after sign-in, counts as one player. The
+    /// id is checked here and used exactly as given: it must not be empty,
+    /// at most 256 bytes of UTF-8, and contain no '@' (emails and handles
+    /// are refused). A refusal returns false, logs one line, and changes
+    /// nothing. The raw id never leaves the device and is never written to
+    /// disk: once the session answer gives the game's salt, the client
+    /// keeps only the salted hash (beside the device id) and sends it once
+    /// per session with the session token. Before that, and before consent
+    /// with Consent::opt_in, the id waits in memory. Signing in as another
+    /// account calls reset_identity() first. Never blocks; the request runs
+    /// on the worker after any queued events.
+    bool identify(const std::string& account_id);
+
+    /// For sign-out: forgets the stored identity (and an id still waiting)
+    /// and switches to a fresh device id exactly as reset_device_id() does,
+    /// so the next player's events are not linked to this account. Sends
+    /// nothing. With nothing stored or waiting it does nothing.
+    void reset_identity();
+
+    /// True while an identity is stored, or an accepted id waits for the
+    /// session answer. The account id itself can never be read back.
+    bool is_identified() const;
+
     // --- State -------------------------------------------------------------
 
     /// Why the client is or is not sending. Changes are also reported to

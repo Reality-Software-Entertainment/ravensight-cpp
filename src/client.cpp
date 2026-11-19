@@ -22,6 +22,7 @@
 #include "error_capture.hpp"
 #include "delivery.hpp"
 #include "health.hpp"
+#include "identify.hpp"
 #include "ravensight/error_capture.hpp"
 #include "remote_config.hpp"
 #include "ravensight/curl_transport.hpp"
@@ -711,11 +712,18 @@ public:
                 queue_path_ = detail::join_path(dir, detail::queue_file_name(detail::trim(config_.ingest_key)));
             }
             attribution_path_ = detail::join_path(dir, "attribution_sent");
+            identity_path_ = detail::join_path(dir, "identity");
+            std::string saved_identity;
+            if (!opted_out_ && detail::read_text_file(identity_path_, saved_identity) &&
+                !detail::read_identity(saved_identity, identity_salt_, identity_hash_)) {
+                detail::remove_file(identity_path_);
+            }
         }
         device_ = build_device_json(config_.device);
         if (opted_out_) {
             // The player said no: nothing tracked before may be sent later.
             forget_delivery_files_locked();
+            delete_identity_file_locked();
         }
 
         apply_local_state_locked();
@@ -1116,9 +1124,14 @@ public:
         const bool was_active = queue_.is_active();
         enabled_ = enabled;
         apply_local_state_locked();
+        if (!enabled) {
+            // Switched off: the identity goes, as on an opt-out.
+            forget_identity_locked();
+        }
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
+        settle_identity_locked();
         update_capture_locked();
         schedule_settings_check_locked();
     }
@@ -1157,10 +1170,12 @@ public:
         apply_local_state_locked();
         if (!enabled) {
             forget_delivery_files_locked();
+            forget_identity_locked();
         }
         if (!was_active && queue_.is_active()) {
             on_locally_enabled_locked();
         }
+        settle_identity_locked();
         update_capture_locked();
         if (!enabled) {
             // The player said no: a crash saved earlier is never sent.
@@ -1176,6 +1191,10 @@ public:
 
     std::string reset_device_id() {
         std::lock_guard<std::mutex> lock(mutex_);
+        return reset_device_id_locked();
+    }
+
+    std::string reset_device_id_locked() {
         if (is_playtest_) {
             note_locked("reset_device_id ignored during a playtest run", false);
             schedule_settings_check_locked();
@@ -1223,6 +1242,50 @@ public:
         forget_delivery_files_locked();
         schedule_settings_check_locked();
         return device_id_;
+    }
+
+    // --- Identify, see docs/identify/CONTRACT.md -------------------------------
+
+    bool identify(const std::string& account_id) {
+        const char* refusal = detail::identify_refusal(account_id);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (refusal != nullptr) {
+            note_locked(std::string("identify refused (") + refusal +
+                            "): an account id is 1 to 256 bytes of text with no @; nothing changed",
+                        true);
+            return false;
+        }
+        if (identify_no_salt_) {
+            // An older server: nothing is held, stored or sent this launch.
+            note_locked("identify is not available from this server; the account id was not kept", false);
+            return true;
+        }
+        if (!identity_hash_.empty()) {
+            // The stored salt is the game's: compare the accounts with it.
+            if (detail::identify_account_hash(identity_salt_, account_id) == identity_hash_) {
+                held_account_.clear();
+                schedule_identify_locked();
+                return true;
+            }
+            // Another account on this device: sign the first one out.
+            reset_identity_locked();
+        }
+        held_account_ = account_id;
+        settle_identity_locked();
+        return true;
+    }
+
+    void reset_identity() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (identity_hash_.empty() && held_account_.empty()) {
+            return;
+        }
+        reset_identity_locked();
+    }
+
+    bool is_identified() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !identity_hash_.empty() || !held_account_.empty();
     }
 
     Status status() const {
@@ -1520,6 +1583,148 @@ private:
         attribution_sent_ = false;
         exposed_.clear();
         persisted_revision_ = queue_.revision();
+    }
+
+    // --- Identify ----------------------------------------------------------------
+
+    bool may_store_identity_locked() const {
+        return !inert_ && enabled_ && !opted_out_ && !stopped_;
+    }
+
+    void delete_identity_file_locked() {
+        if (!identity_path_.empty()) {
+            detail::remove_file(identity_path_);
+            detail::remove_temp_files(identity_path_);
+        }
+    }
+
+    // Opt-out, consent withdrawn or the game's switch off: the stored
+    // identity and any id still waiting are gone.
+    void forget_identity_locked() {
+        delete_identity_file_locked();
+        identity_salt_.clear();
+        identity_hash_.clear();
+        held_account_.clear();
+        identify_due_ = false;
+        ++identify_generation_;
+    }
+
+    // Sign-out: forget the identity, then a fresh device id and session.
+    void reset_identity_locked() {
+        forget_identity_locked();
+        reset_device_id_locked();
+    }
+
+    // Hashes an id that was waiting, once the salt is known and the client
+    // may store, then saves it and asks the worker to send it.
+    void settle_identity_locked() {
+        if (held_account_.empty() || launch_salt_.empty() || !may_store_identity_locked()) {
+            return;
+        }
+        identity_salt_ = launch_salt_;
+        identity_hash_ = detail::identify_account_hash(launch_salt_, held_account_);
+        held_account_.clear();
+        ++identify_generation_;
+        if (!identity_path_.empty() &&
+            !detail::write_text_file(identity_path_, detail::write_identity(identity_salt_, identity_hash_))) {
+            note_locked("could not save the identity to " + identity_path_ + "; it is kept for this run", true);
+        }
+        schedule_identify_locked();
+    }
+
+    void schedule_identify_locked() {
+        if (inert_ || identity_hash_.empty()) {
+            return;
+        }
+        identify_due_ = true;
+        wake_ = true;
+        cv_.notify_all();
+    }
+
+    // A session answer: the game's salt, or none from an older server.
+    void apply_identify_answer_locked(const json::Value& answer) {
+        if (identify_no_salt_) {
+            return;
+        }
+        const json::Value* identify = answer.find("identify");
+        const std::string salt =
+            identify != nullptr && identify->is_object() ? identify->get_string("salt", "") : "";
+        if (!detail::is_identify_hex(salt)) {
+            identify_no_salt_ = true;
+            launch_salt_.clear();
+            if (!held_account_.empty()) {
+                held_account_.clear();
+                note_locked("identify is not available from this server; the account id was dropped", false);
+            }
+            return;
+        }
+        launch_salt_ = salt;
+        if (!identity_hash_.empty() && identity_salt_ != salt) {
+            // Made under another game's key: never sent here.
+            delete_identity_file_locked();
+            identity_salt_.clear();
+            identity_hash_.clear();
+            ++identify_generation_;
+            note_locked("forgot an identity saved under another game's key", false);
+        }
+        settle_identity_locked();
+        schedule_identify_locked();
+    }
+
+    // Worker thread: one POST /identify for the current session, after the
+    // events. Each session is tried once, whatever the answer.
+    void run_identify() {
+        std::string token;
+        std::string hash;
+        unsigned long long generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!identify_due_) {
+                return;
+            }
+            if (identity_hash_.empty() || identify_stopped_ || identify_no_salt_ ||
+                !queue_.is_active() || shutdown_requested_) {
+                identify_due_ = false;
+                return;
+            }
+            if (!queue_.is_session_valid(now_unix_seconds()) || launch_salt_ != identity_salt_) {
+                return; // the next session answer asks again
+            }
+            identify_due_ = false;
+            token = queue_.session_token();
+            if (token == identify_done_token_) {
+                return;
+            }
+            identify_done_token_ = token;
+            hash = identity_hash_;
+            generation = identify_generation_;
+        }
+        json::ObjectWriter body;
+        body.add("accountHash", hash);
+        Request request = make_request("POST", "/identify", true);
+        request.with_header("Content-Type", "application/json");
+        request.with_header("X-Session-Token", token);
+        request.body = body.str();
+        const Response response = transport_->send(request);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation != identify_generation_ || token != queue_.session_token()) {
+            return; // a late answer for an identity or session that is gone
+        }
+        const std::string code = response.error_code("");
+        if (response.status >= 200 && response.status < 300) {
+            note_locked("identified this session", false);
+        } else if (response.status == 404 || (response.status == 400 && code == "invalid_account_hash")) {
+            identify_stopped_ = true;
+            note_locked("identify refused (HTTP " + std::to_string(response.status) +
+                            (code.empty() ? std::string() : " " + code) +
+                            "); not tried again this run, the identity is kept",
+                        response.status == 400);
+        } else {
+            note_locked("identify not done (HTTP " + std::to_string(response.status) +
+                            (code.empty() ? std::string() : " " + code) + "); tried again next session",
+                        false);
+        }
     }
 
     static std::string build_device_json(const DeviceInfo& device) {
@@ -2046,6 +2251,7 @@ private:
                 }
                 queue_.set_session(token, expires_at);
                 apply_capture_answer_locked(parsed);
+                apply_identify_answer_locked(parsed);
                 if (join_token_ == join_token) {
                     join_token_.clear();
                 }
@@ -2467,6 +2673,7 @@ private:
             }
             if (command) {
                 command();
+                run_identify();
                 update_status();
                 continue;
             }
@@ -2476,6 +2683,7 @@ private:
             if (config_.flush_interval_seconds > 0.0 || force || wake) {
                 flush_cycle(force);
             }
+            run_identify();
             next_timer_flush = now_unix_seconds() + interval;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -2614,6 +2822,19 @@ private:
     bool attribution_sent_ = false;
     std::vector<std::pair<std::string, std::string>> exposed_;
 
+    // Identify, guarded by mutex_. The raw account id lives only in
+    // held_account_, in memory, until the salt is known and it is hashed.
+    std::string identity_path_;
+    std::string held_account_;
+    std::string identity_salt_;
+    std::string identity_hash_;
+    std::string launch_salt_;
+    std::string identify_done_token_;
+    bool identify_due_ = false;
+    bool identify_no_salt_ = false;
+    bool identify_stopped_ = false;
+    unsigned long long identify_generation_ = 0;
+
     std::thread worker_;
 };
 
@@ -2693,6 +2914,9 @@ bool Client::is_collecting() const { return impl_->is_collecting(); }
 void Client::set_tracking_enabled(bool enabled) { impl_->set_tracking_enabled(enabled); }
 bool Client::is_tracking_enabled_by_player() const { return impl_->is_tracking_enabled_by_player(); }
 std::string Client::reset_device_id() { return impl_->reset_device_id(); }
+bool Client::identify(const std::string& account_id) { return impl_->identify(account_id); }
+void Client::reset_identity() { impl_->reset_identity(); }
+bool Client::is_identified() const { return impl_->is_identified(); }
 Status Client::status() const { return impl_->status(); }
 bool Client::tracking_enabled() const { return impl_->tracking_enabled(); }
 bool Client::is_ready() const { return impl_->is_ready(); }

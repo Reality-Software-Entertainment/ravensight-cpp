@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "delivery.hpp"
 #include "identify.hpp"
 #include "ravensight/client.hpp"
 #include "storage.hpp"
@@ -616,17 +617,20 @@ RS_TEST(identify_reset_identity_drops_a_held_id_too) {
 
 // --- a late answer -----------------------------------------------------------------------
 
-RS_TEST(identify_a_late_200_after_reset_does_not_mark_the_new_session) {
+namespace {
+
+void late_answer_after_reset(long late_status) {
     const std::string dir = rstest::make_temp_dir();
     auto server = std::make_shared<Server>();
     std::mutex gate_mutex;
     std::condition_variable gate;
     bool release = false;
     std::atomic<int> calls{0};
-    server->on_identify = [&](const Request&) {
+    server->on_identify = [&, late_status](const Request&) {
         if (++calls == 1) {
             std::unique_lock<std::mutex> lock(gate_mutex);
             gate.wait_for(lock, std::chrono::seconds(3), [&] { return release; });
+            return reply(late_status, late_status == 200 ? "{\"playerId\":\"px_0\",\"repeat\":false}" : "{}");
         }
         return reply(200, "{\"playerId\":\"px_0\",\"linked\":true,\"verified\":false,\"repeat\":false}");
     };
@@ -649,3 +653,10 @@ RS_TEST(identify_a_late_200_after_reset_does_not_mark_the_new_session) {
     CHECK(sends[1].second != sends[0].second);
     CHECK_EQ(stored(dir).get_string("accountHash", ""), sends[1].second);
 }
+
+} // namespace
+
+RS_TEST(identify_a_late_200_after_reset_does_not_mark_the_new_session) { late_answer_after_reset(200); }
+
+// A late 404 would stop identify for the launch if it were applied.
+RS_TEST(identify_a_late_404_after_reset_changes_nothing) { late_answer_after_reset(404); }
