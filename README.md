@@ -756,10 +756,17 @@ If your game has its own accounts, tell the client who signed in, so one
 person on two devices, or before and after sign-in, counts as one player:
 
 ```cpp
-client.identify(account.id());   // after your own sign-in succeeds
-client.reset_identity();         // on sign-out
+client.identify(account.analytics_id());   // after your own sign-in succeeds: a random id stored with the account
+client.reset_identity();                   // on sign-out
 ```
 
+- **Pass a random, high-entropy id**, such as a random UUID or a random
+  analytics id you make once for each account and store with it, never a
+  sequential database key, an email, a name or a handle. Your game's salt
+  reaches every copy of the game, so anyone could hash 1, 2, 3 and onward
+  and match a guessable id; a random one cannot be guessed. The hash is
+  still a pseudonymous identifier for the player: declare it in your game's
+  privacy notice.
 - **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
   game's own salt, which the session answer gives the client) and the
   session token, once per session. The raw account id is never sent and
