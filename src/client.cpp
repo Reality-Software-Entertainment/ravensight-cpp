@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "campaign_link.hpp"
 #include "error_capture.hpp"
 #include "delivery.hpp"
 #include "health.hpp"
@@ -626,6 +627,9 @@ public:
             }
         }
         join_token_ = detail::trim(config_.join_token);
+        // A web build's page address: the rs_link a campaign link added on
+        // its redirect, read once for the process and never stored.
+        campaign_link_ = detail::take_page_campaign_link();
         enabled_ = config_.enabled;
         consent_ = config_.consent;
         start_unix_ = static_cast<long long>(now_unix_seconds());
@@ -1283,6 +1287,19 @@ public:
         }
         held_account_ = account_id;
         settle_identity_locked();
+        return true;
+    }
+
+    // --- Campaign links -----------------------------------------------------------
+
+    bool set_campaign_link(const std::string& link_id) {
+        const std::string link = detail::campaign_link_id(link_id);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (link.empty()) {
+            note_locked("campaign link refused: a link id is 24 hex characters; nothing changed", false);
+            return false;
+        }
+        campaign_link_ = link;
         return true;
     }
 
@@ -2243,6 +2260,7 @@ private:
                 return false;
             }
             std::string join_token;
+            std::string campaign_link;
             unsigned long long generation = 0;
             json::ObjectWriter body;
             {
@@ -2250,6 +2268,11 @@ private:
                 join_token = join_token_;
                 generation = identity_generation_;
                 body.add("deviceId", device_id_);
+                // The player's own session only, never a playtest run or a
+                // joined session, and once.
+                if (!is_playtest_ && join_token.empty()) {
+                    campaign_link = campaign_link_;
+                }
             }
             body.add("gameVersion", config_.game_version);
             body.add("platform", platform_);
@@ -2262,6 +2285,9 @@ private:
             }
             if (!device_.empty()) {
                 body.add_raw("device", device_);
+            }
+            if (!campaign_link.empty()) {
+                body.add("campaignLink", campaign_link);
             }
 
             Request request = make_request("POST", "/session", true);
@@ -2278,6 +2304,11 @@ private:
                     queue_.schedule_backoff(now_unix_seconds());
                     record_transient_locked(Status::session_failed, response);
                     return false;
+                }
+                // The server has the link with this session. One set while
+                // the request was in flight waits for the next session.
+                if (!campaign_link.empty() && campaign_link_ == campaign_link) {
+                    campaign_link_.clear();
                 }
                 double expires_at = 0.0;
                 if (!parsed.get_number("expiresAt", expires_at) || expires_at <= 0.0) {
@@ -2809,6 +2840,8 @@ private:
     bool config_pending_ = false;
     std::string device_id_;
     std::string join_token_;
+    // A campaign link id waiting for the next session; memory only.
+    std::string campaign_link_;
     std::string last_error_;
     bool device_id_saved_ = false;
     bool enabled_ = true;
@@ -2972,7 +3005,7 @@ std::string Client::reset_device_id() { return impl_->reset_device_id(); }
 bool Client::identify(const std::string& account_id) { return impl_->identify(account_id); }
 void Client::reset_identity() { impl_->reset_identity(); }
 bool Client::is_identified() const { return impl_->is_identified(); }
-bool Client::set_campaign_link(const std::string&) { return false; }
+bool Client::set_campaign_link(const std::string& link_id) { return impl_->set_campaign_link(link_id); }
 Status Client::status() const { return impl_->status(); }
 bool Client::tracking_enabled() const { return impl_->tracking_enabled(); }
 bool Client::is_ready() const { return impl_->is_ready(); }

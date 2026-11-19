@@ -26,5 +26,10 @@ std::string campaign_link_from_search(const std::string& search);
 /// main thread. Empty on every other build, and when the page has none.
 std::string page_search();
 
+/// The link id in the page's address (campaign_link_from_search over
+/// page_search) the first time it is called in this process; empty on
+/// every later call, so a second client on the same page sends none.
+std::string take_page_campaign_link();
+
 } // namespace detail
 } // namespace ravensight
