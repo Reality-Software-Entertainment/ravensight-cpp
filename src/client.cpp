@@ -1288,6 +1288,9 @@ public:
 
     void reset_identity() {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A sign-out turns identify back on after no_session stopped it.
+        identify_no_session_count_ = 0;
+        identify_no_session_stopped_ = false;
         std::string on_disk;
         const bool saved = !identity_path_.empty() && detail::read_text_file(identity_path_, on_disk);
         if (identity_hash_.empty() && held_account_.empty() && !saved) {
@@ -1624,6 +1627,8 @@ private:
 
     // Sign-out: forget the identity, then a fresh device id and session.
     void reset_identity_locked() {
+        identify_no_session_count_ = 0;
+        identify_no_session_stopped_ = false;
         forget_identity_locked();
         reset_device_id_locked();
     }
@@ -1711,7 +1716,7 @@ private:
             if (!identify_due_) {
                 return;
             }
-            if (identity_hash_.empty() || identify_stopped_ || identify_no_salt_ || is_playtest_ ||
+            if (identity_hash_.empty() || identify_stopped_ || identify_no_session_stopped_ || identify_no_salt_ || is_playtest_ ||
                 !queue_.is_active() || shutdown_requested_) {
                 identify_due_ = false;
                 return;
@@ -1743,6 +1748,18 @@ private:
             return; // a late answer for an identity or session that is gone
         }
         const std::string code = response.error_code("");
+        // no_session: the first is tried once at the next session, a second
+        // in a row stops identify until reset_identity. Any other answer
+        // resets the count.
+        if (response.status == 400 && code == "no_session") {
+            if (++identify_no_session_count_ >= 2) {
+                identify_no_session_stopped_ = true;
+                note_locked("identify refused twice in a row (no_session); not tried again until reset_identity", false);
+                return;
+            }
+        } else {
+            identify_no_session_count_ = 0;
+        }
         if (response.status >= 200 && response.status < 300) {
             note_locked("identified this session", false);
         } else if (response.status == 404 || (response.status == 400 && code == "invalid_account_hash")) {
@@ -2869,6 +2886,8 @@ private:
     bool identify_due_ = false;
     bool identify_no_salt_ = false;
     bool identify_stopped_ = false;
+    int identify_no_session_count_ = 0;
+    bool identify_no_session_stopped_ = false;
     unsigned long long identify_generation_ = 0;
 
     std::thread worker_;
