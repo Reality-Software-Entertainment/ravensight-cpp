@@ -2,7 +2,7 @@
 
 All notable changes to this library are documented here.
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-11-21
 
 Implements the Ravensight identify contract (version 2). Needs a Ravensight
 server whose session answer carries `identify.salt` and that offers

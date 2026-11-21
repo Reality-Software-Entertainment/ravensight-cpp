@@ -126,7 +126,7 @@ Everything game code needs is on `ravensight::Client`:
 | `client.track_resource(flow, resource, amount, ...)` | Typed resource source or sink event. |
 | `client.track_progression(status, p1, p2, p3, score, ...)` | Typed progression start, complete or fail event. |
 | `client.track_error(severity, message, stack, ...)` | Typed error event, message and stack cut to the limits. |
-| `client.set_error_capture(bool)` | Turns automatic error capture on or off for this run. Not saved. See [Error capture](#error-capture-unreleased). |
+| `client.set_error_capture(bool)` | Turns automatic error capture on or off for this run. Not saved. See [Error capture](#error-capture). |
 | `client.is_error_capture_active()` | True while this client holds automatic error capture. |
 | `client.sample_frame(dt_seconds)` | Call once per frame. With `Config::performance` it samples the frame rate once a second. |
 | `client.flush()` | Asks the worker to flush now. Non blocking. |
@@ -228,7 +228,7 @@ client.track_purchase(99, "usd", "skin", "red_cape", "", "",
                       {{"source", "shop"}}, "iap");
 ```
 
-## Error capture (Unreleased)
+## Error capture
 
 Errors in a live game go unnoticed unless something reports them. The SDK
 reports them as ordinary `error` events: one captured error is one event on
@@ -391,7 +391,7 @@ The session request also carries `"sdk": "cpp/<version>"`.
 | `enabled` | on | Start with the client off. Never saved. |
 | `join_token` | empty | A session token from the player's client, sent once as `joinToken` (see [Dedicated servers](#dedicated-servers)). |
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | empty | Playtest overrides. Normally read from the environment (see [Playtest](#playtest)). |
-| `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture-unreleased). |
+| `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture). |
 | `install_signal_handlers` | off | POSIX only: also record fatal signals for the next launch. |
 | `persist_queue` | on | Keep unsent events in a file in the storage directory, so they are sent on the next launch (see [How delivery works](#how-delivery-works)). |
 | `device` | empty | Optional `model`, `os_version` and `gpu`, sent once on the session (see [Device id and storage](#device-id-and-storage)). |
@@ -402,7 +402,7 @@ The session request also carries `"sdk": "cpp/<version>"`.
 
 Two lifecycle events are sent without a `track` call, unless
 `track_lifecycle_events` is off (captured errors are described in
-[Error capture](#error-capture-unreleased)):
+[Error capture](#error-capture)):
 
 * `game_started`, queued once when the client is constructed, so it is the
   first event and carries the real start time. A client constructed

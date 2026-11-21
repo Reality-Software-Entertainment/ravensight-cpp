@@ -58,3 +58,10 @@ No live service requests, pushes, tags or publication were performed.
   stubbed page (18 of 18), not in a browser.
 - The README deep link example was compiled and run (7 of 7).
 - No live Ravensight service was used. Nothing was published, tagged or deployed.
+
+### Release candidate (November 21, 2026)
+
+- `feat/campaign-link` and `feat/identify` merged onto `main` at babcb32 as
+  0.6.0. `cmake` Release build and `ctest` on macOS (Apple clang): **261 tests
+  passed**, 5,057 assertions, 0 failures. Ubuntu gcc and clang run in CI;
+  Windows was not built here.
