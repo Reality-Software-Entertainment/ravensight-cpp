@@ -58,7 +58,7 @@ issue with anything you hit.
 include(FetchContent)
 FetchContent_Declare(ravensight
     GIT_REPOSITORY https://github.com/Reality-Software-Entertainment/ravensight-cpp.git
-    GIT_TAG v0.5.0)
+    GIT_TAG v0.6.0)
 FetchContent_MakeAvailable(ravensight)
 
 target_link_libraries(your_game PRIVATE ravensight::ravensight)
@@ -126,7 +126,7 @@ Everything game code needs is on `ravensight::Client`:
 | `client.track_resource(flow, resource, amount, ...)` | Typed resource source or sink event. |
 | `client.track_progression(status, p1, p2, p3, score, ...)` | Typed progression start, complete or fail event. |
 | `client.track_error(severity, message, stack, ...)` | Typed error event, message and stack cut to the limits. |
-| `client.set_error_capture(bool)` | Turns automatic error capture on or off for this run. Not saved. See [Error capture](#error-capture-unreleased). |
+| `client.set_error_capture(bool)` | Turns automatic error capture on or off for this run. Not saved. See [Error capture](#error-capture). |
 | `client.is_error_capture_active()` | True while this client holds automatic error capture. |
 | `client.sample_frame(dt_seconds)` | Call once per frame. With `Config::performance` it samples the frame rate once a second. |
 | `client.flush()` | Asks the worker to flush now. Non blocking. |
@@ -135,6 +135,7 @@ Everything game code needs is on `ravensight::Client`:
 | `client.fetch_suggestions(callback)` | EXPERIMENTAL. AI generated design suggestions for your game. |
 | `client.set_tracking_enabled(bool)` | The player's analytics choice, saved and remembered across launches. |
 | `client.reset_device_id()` | A fresh random identity from now on. Returns the new id. |
+| `client.set_campaign_link(id)` | The campaign link id your deep link handler received, sent once with the next session. See [Campaign links](#campaign-links). |
 | `client.set_enabled(bool)` | Runtime on and off for your own logic. Not saved. |
 | `client.is_collecting()` | True only while the client is collecting: a key, enabled, the player's choice allows it, the kill switch on and the key accepted. |
 | `client.status()` | Why the client is or is not sending (see [Status and reasons](#status-and-reasons)). |
@@ -227,7 +228,7 @@ client.track_purchase(99, "usd", "skin", "red_cape", "", "",
                       {{"source", "shop"}}, "iap");
 ```
 
-## Error capture (Unreleased)
+## Error capture
 
 Errors in a live game go unnoticed unless something reports them. The SDK
 reports them as ordinary `error` events: one captured error is one event on
@@ -390,7 +391,7 @@ The session request also carries `"sdk": "cpp/<version>"`.
 | `enabled` | on | Start with the client off. Never saved. |
 | `join_token` | empty | A session token from the player's client, sent once as `joinToken` (see [Dedicated servers](#dedicated-servers)). |
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | empty | Playtest overrides. Normally read from the environment (see [Playtest](#playtest)). |
-| `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture-unreleased). |
+| `error_capture` | on | Automatic error capture: the terminate handler and `ravensight::log`. See [Error capture](#error-capture). |
 | `install_signal_handlers` | off | POSIX only: also record fatal signals for the next launch. |
 | `persist_queue` | on | Keep unsent events in a file in the storage directory, so they are sent on the next launch (see [How delivery works](#how-delivery-works)). |
 | `device` | empty | Optional `model`, `os_version` and `gpu`, sent once on the session (see [Device id and storage](#device-id-and-storage)). |
@@ -401,7 +402,7 @@ The session request also carries `"sdk": "cpp/<version>"`.
 
 Two lifecycle events are sent without a `track` call, unless
 `track_lifecycle_events` is off (captured errors are described in
-[Error capture](#error-capture-unreleased)):
+[Error capture](#error-capture)):
 
 * `game_started`, queued once when the client is constructed, so it is the
   first event and carries the real start time. A client constructed
@@ -749,6 +750,101 @@ A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
+
+## Identify players who sign in
+
+If your game has its own accounts, tell the client who signed in, so one
+person on two devices, or before and after sign-in, counts as one player:
+
+```cpp
+client.identify(account.analytics_id());   // after your own sign-in succeeds: a random id stored with the account
+client.reset_identity();                   // on sign-out
+```
+
+- **Pass a random, high-entropy id**, such as a random UUID or a random
+  analytics id you make once for each account and store with it, never a
+  sequential database key, an email, a name or a handle. Your game's salt
+  reaches every copy of the game, so anyone could hash 1, 2, 3 and onward
+  and match a guessable id; a random one cannot be guessed. The hash is
+  still a pseudonymous identifier for the player: declare it in your game's
+  privacy notice.
+- **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
+  game's own salt, which the session answer gives the client) and the
+  session token, once per session. The raw account id is never sent and
+  never written to disk; emails and names are never sent.
+- **Checked on the device:** the id must not be empty, must be at most 256
+  bytes of UTF-8 and must not contain `@`, so an email or a handle is
+  refused. It is used exactly as given (never trimmed). A refusal returns
+  `false`, logs one line and changes nothing.
+- **Remembered:** only the hash and the salt are saved, in a file named
+  `identity` beside the device id, so the next launch identifies its
+  session without another call. `is_identified()` says whether one is set.
+- **`reset_identity()`** on sign-out forgets it and switches to a fresh
+  device id, exactly like `reset_device_id()`, so the next player on this
+  device is not linked to the account. `reset_device_id()` alone keeps it.
+- **Signing in as another account** calls `reset_identity()` for you first.
+- **Consent:** without a key, or with `Consent::opt_in` before the yes, the
+  id waits in memory and nothing is sent. The player's opt-out
+  (`set_tracking_enabled(false)`) forgets it; your own switch,
+  `set_enabled(false)`, keeps it and identifies again when turned back on.
+  A playtest run keeps it in memory and sends nothing.
+- **Cost:** one event on your usage meter per identified session. The call
+  runs on the worker after queued events and never delays them.
+
+A game that calls `identify` links its data to the player's account:
+answer the store privacy forms that way.
+
+## Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at
+a web page adds `rs_link=<link id>` to the address it redirects to. The
+client sends that id once, as `campaignLink`, with the first session it
+opens for the player. The server keeps it only when it names a link of the
+same game, then counts the player and the session on the Campaign links
+page, by link, and the players open in Player insights.
+
+The web is not a supported target for this SDK, so a game passes the id
+on itself. A native build cannot see how the game was opened, so pass it on
+from the handler that already receives the address: your deep link,
+universal link or App Link handler, or the install referrer. Point the
+link at your own https page, which is also your universal link or App
+Link, and the address the game receives carries `rs_link`:
+
+```cpp
+// url: the address that opened the game, for example
+// https://play.example.com/open?rs_link=64b0000000000000000000a1
+void on_open_url(ravensight::Client& client, const std::string& url) {
+    const std::string address = url.substr(0, url.find('#'));
+    const std::size_t query = address.find('?');
+    if (query == std::string::npos) return;
+    const std::string params = address.substr(query + 1);
+    for (std::size_t start = 0; start < params.size();) {
+        std::size_t end = params.find('&', start);
+        if (end == std::string::npos) end = params.size();
+        if (params.compare(start, 8, "rs_link=") == 0) {
+            client.set_campaign_link(params.substr(start + 8, end - start - 8));
+            return;
+        }
+        start = end + 1;
+    }
+}
+```
+
+`set_campaign_link` returns true when the id is a link id (24 hex
+characters, any case) and is now waiting, and false for anything else,
+which changes nothing. A later valid call replaces one still waiting. Call
+it before the first session when you can; a call after that goes with the
+next session the client opens.
+
+- **Once:** a failed session keeps the link for the next attempt. Once the
+  server accepts a session that carried it, it is forgotten, and later
+  sessions (a renewal, a new device id) carry none.
+- **Consent:** the same as everything else. With `Consent::opt_in` it waits
+  for the player's yes and goes with the first session after it. An opted
+  out player, a client with no key, a playtest run and a session opened with
+  a join token send nothing.
+- **Nothing stored:** it is held in memory only, never written to disk. The
+  id is one your studio created, not personal data.
 
 ## Telling players
 

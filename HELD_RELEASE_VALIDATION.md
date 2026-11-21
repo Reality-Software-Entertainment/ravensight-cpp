@@ -34,3 +34,34 @@ No live service requests, pushes, tags or publication were performed.
 - Evidence: `/tmp/rs-cpp-reports-build.log`, `/tmp/rs-cpp-reports-tests.log`.
 - Tests use scripted transport. Actual storage uploads, packaged games and device integration remain
   release checks; no publishing, tagging, pushes or deployments were performed.
+
+## 0.6.0: identify players who sign in (November 19, 2026)
+
+- Branch `feat/identify`, built to the platform's identify contract version 2.
+- `cmake` Release build and `ravensight_tests`: **239 tests passed**, 0 failed
+  (213 before), every identify case against a fake transport.
+- No live Ravensight service was used. Nothing was published, tagged or deployed.
+
+### Campaign links (same 0.6.0)
+
+- Branch `feat/campaign-link`, on `feat/identify` at 2c6d47a, built to the
+  campaign link contract (the JavaScript SDK is the reference).
+- `cmake` Release build and `ravensight_tests`: **261 tests passed**, 5,057
+  assertions, 0 failures, no build warnings; the red run failed in the new
+  cases only. The cases cover the setter, 25 `rs_link` parsing vectors, once
+  per session, kept after a 500, no answer, a 429 and a 201 without a token,
+  a link set while a session is in flight, opt in, opt out, disabled, no key,
+  a playtest run and a join token. The pre-push `ctest` passed again on the
+  final head.
+- The web is not a supported target. The compile-guarded Emscripten page read
+  was built with an Emscripten 4.0.20 toolchain and run under node with a
+  stubbed page (18 of 18), not in a browser.
+- The README deep link example was compiled and run (7 of 7).
+- No live Ravensight service was used. Nothing was published, tagged or deployed.
+
+### Release candidate (November 21, 2026)
+
+- `feat/campaign-link` and `feat/identify` merged onto `main` at babcb32 as
+  0.6.0. `cmake` Release build and `ctest` on macOS (Apple clang): **261 tests
+  passed**, 5,057 assertions, 0 failures. Ubuntu gcc and clang run in CI;
+  Windows was not built here.

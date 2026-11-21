@@ -595,6 +595,49 @@ public:
     /// inert client.
     std::string reset_device_id();
 
+    // --- Identify players who sign in --------------------------------------
+
+    /// Links this device to the game's own account id, so one person on
+    /// two devices, or before and after sign-in, counts as one player. The
+    /// id is checked here and used exactly as given: it must not be empty,
+    /// at most 256 bytes of UTF-8, and contain no '@' (emails and handles
+    /// are refused). A refusal returns false, logs one line, and changes
+    /// nothing. The raw id never leaves the device and is never written to
+    /// disk: once the session answer gives the game's salt, the client
+    /// keeps only the salted hash (beside the device id) and sends it once
+    /// per session with the session token. Before that, and before consent
+    /// with Consent::opt_in, the id waits in memory. Signing in as another
+    /// account calls reset_identity() first. Never blocks; the request runs
+    /// on the worker after any queued events.
+    bool identify(const std::string& account_id);
+
+    /// For sign-out: forgets the stored identity (and an id still waiting)
+    /// and switches to a fresh device id exactly as reset_device_id() does,
+    /// so the next player's events are not linked to this account. Sends
+    /// nothing. With nothing stored or waiting it does nothing.
+    void reset_identity();
+
+    /// True while an identity is stored, or an accepted id waits for the
+    /// session answer. The account id itself can never be read back.
+    bool is_identified() const;
+
+    // --- Campaign links ----------------------------------------------------
+
+    /// The Ravensight campaign link this player arrived by: the `rs_link`
+    /// value (24 hex characters) your deep link, universal link, App Link
+    /// or install referrer handler pulled out of the incoming address. It
+    /// goes once, as `campaignLink`, with the next session this client
+    /// opens for its player, and is forgotten when the server accepts that
+    /// session; a failed attempt keeps it for the next. Returns true when
+    /// `link_id` is a link id and is now waiting; anything else returns
+    /// false and leaves a waiting link as it was. A later valid call
+    /// replaces it. Best called before the first session. Never sent in a
+    /// playtest run or with a join token, before consent, or without a
+    /// key, and never written to disk. The web is not a supported target;
+    /// a build compiled with Emscripten anyway reads `rs_link` from the
+    /// page's address once, when the first client is constructed.
+    bool set_campaign_link(const std::string& link_id);
+
     // --- State -------------------------------------------------------------
 
     /// Why the client is or is not sending. Changes are also reported to

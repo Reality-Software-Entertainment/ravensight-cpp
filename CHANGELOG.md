@@ -2,6 +2,29 @@
 
 All notable changes to this library are documented here.
 
+## [0.6.0] - 2026-11-21
+
+Implements the Ravensight identify contract (version 2). Needs a Ravensight
+server whose session answer carries `identify.salt` and that offers
+`POST /api/v1/identify`; against an older server identify does nothing.
+
+### Added
+
+* `Client::identify(account_id)`, `Client::reset_identity()` and
+  `Client::is_identified()`. The id is checked on the device (not empty, at
+  most 256 UTF-8 bytes, no `@`, never trimmed) and only its HMAC-SHA256 with
+  the game's salt is sent, once per session, with the session token. The
+  hash and salt are saved in an `identity` file beside the device id; the
+  raw id is held in memory only until the salt is known.
+* A different salt deletes the saved identity, a session answer with no
+  salt drops a held id for the launch, signing in as another account resets
+  first, and opt-out and consent withdrawn forget it. `set_enabled(false)`
+  keeps it. A playtest run keeps it in memory and sends nothing.
+* The contract's binding vectors in `tests/fixtures/identify-vectors.json`.
+* Campaign links: `Client::set_campaign_link(link_id)` for a deep link, universal link,
+  App Link or install referrer. The id goes once, as `campaignLink`, on the player's next
+  `POST /session`.
+
 ## [0.5.0] - 2026-11-06
 
 Implements the Ravensight delivery, ads and attribution, exposure and
